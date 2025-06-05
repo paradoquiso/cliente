@@ -524,6 +524,7 @@ def ml_callback():
 # --- FIM ROTAS ML --- 
 
 @app.route('/buscar_produto', methods=['POST'])
+@app.route('/buscar_ean', methods=['POST']) # Adicionado alias para compatibilidade
 def buscar_produto():
     if 'user_id' not in session:
         return jsonify({'success': False, 'message': 'Sessão expirada. Faça login novamente.'}), 401
