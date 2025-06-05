@@ -1,147 +1,281 @@
 # -*- coding: utf-8 -*-
 import sys
 import os
-import sqlite3
-import time # Importar time para verificar expiração do token
-from datetime import datetime, timezone
+# import sqlite3 # Removido - Usaremos PostgreSQL com SQLAlchemy
+import time
+from datetime import datetime, timezone, timedelta # Adicionado timedelta
 import io
 import requests
 from flask import Flask, render_template, request, jsonify, send_file, redirect, url_for, session, flash
+from flask_sqlalchemy import SQLAlchemy # Adicionado SQLAlchemy
 import pandas as pd
 import json
 from werkzeug.security import generate_password_hash, check_password_hash
 from src.utils import formatar_data_brasileira
-# Importar as funções do módulo de integração ML atualizado
+# Importar funções do módulo ML, mas a lógica de token será movida/adaptada
 from src.mercado_livre import (
-    get_authorization_url,
-    exchange_code_for_token,
-    buscar_produto_por_ean as buscar_produto_online, # Renomeado para clareza
+    get_authorization_url as ml_get_authorization_url, # Renomeado para evitar conflito
+    exchange_code_for_token as ml_exchange_code_for_token,
+    refresh_access_token as ml_refresh_access_token,
+    buscar_produto_por_ean as buscar_produto_online,
     fallback_busca_produto,
-    load_token_data, # Para verificar se o token existe
-    TOKEN_FILE_PATH # Para verificar se o arquivo existe
+    CLIENT_ID, # Importar para uso nas funções de token
+    CLIENT_SECRET,
+    REDIRECT_URI
 )
-import re # Importar re para limpar nome de arquivo
-import logging # Adicionar logging
+import re
+import logging
 
 # Configurar logging básico
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
-# Chave secreta para a sessão Flask (essencial para segurança)
-# IMPORTANTE: Mudar para uma variável de ambiente segura em produção!
-app.secret_key = os.environ.get("FLASK_SECRET_KEY", "ean_app_secret_key_default_dev_only_unsafe") 
 
-# Configuração do banco de dados SQLite (mantida)
-DATABASE_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "produtos.db")
-logger.info(f"Usando banco de dados SQLite em: {DATABASE_PATH}")
+# --- Configuração do Banco de Dados PostgreSQL --- 
+# Ler a URL do banco de dados da variável de ambiente fornecida pelo Render
+DATABASE_URL = os.environ.get("DATABASE_URL")
+if not DATABASE_URL:
+    logger.critical("### ERRO CRÍTICO: Variável de ambiente DATABASE_URL não definida! A aplicação não funcionará. Verifique a configuração no Render. ###")
+    # Em um app real, talvez parar a aplicação aqui?
+    # Para desenvolvimento local, você pode definir uma URL padrão:
+    # DATABASE_URL = "postgresql://user:password@host:port/database"
 
-# --- Funções de Banco de Dados (mantidas como no original) ---
-def get_db_connection():
-    conn = sqlite3.connect(DATABASE_PATH)
-    conn.row_factory = sqlite3.Row 
-    return conn
+# Ajustar a URL se ela começar com postgres:// em vez de postgresql:// (comum no Heroku/Render)
+if DATABASE_URL and DATABASE_URL.startswith("postgres://"):
+    DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
 
-def init_database():
+app.config["SQLALCHEMY_DATABASE_URI"] = DATABASE_URL
+app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False # Desativa warnings
+
+db = SQLAlchemy(app)
+
+# Chave secreta para a sessão Flask
+app.secret_key = os.environ.get("FLASK_SECRET_KEY", "ean_app_secret_key_default_dev_only_unsafe")
+
+# --- Modelos do Banco de Dados (SQLAlchemy) --- 
+
+class Usuario(db.Model):
+    __tablename__ = "usuarios"
+    id = db.Column(db.Integer, primary_key=True)
+    nome = db.Column(db.String, unique=True, nullable=False)
+    senha_hash = db.Column(db.String, nullable=False)
+    admin = db.Column(db.Boolean, default=False)
+    produtos = db.relationship("Produto", backref="autor", lazy=True)
+
+class Responsavel(db.Model):
+    __tablename__ = "responsaveis"
+    id = db.Column(db.Integer, primary_key=True)
+    nome = db.Column(db.String, unique=True, nullable=False)
+    pin = db.Column(db.String, nullable=False)
+    produtos = db.relationship("Produto", backref="responsavel_associado", lazy=True)
+
+class Produto(db.Model):
+    __tablename__ = "produtos"
+    id = db.Column(db.Integer, primary_key=True)
+    ean = db.Column(db.String, nullable=False)
+    nome = db.Column(db.String, nullable=False)
+    cor = db.Column(db.String)
+    voltagem = db.Column(db.String)
+    modelo = db.Column(db.String)
+    quantidade = db.Column(db.Integer, nullable=False)
+    usuario_id = db.Column(db.Integer, db.ForeignKey("usuarios.id"), nullable=False)
+    timestamp = db.Column(db.DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+    enviado = db.Column(db.Boolean, default=False)
+    data_envio = db.Column(db.DateTime(timezone=True))
+    validado = db.Column(db.Boolean, default=False)
+    validador_id = db.Column(db.Integer, db.ForeignKey("usuarios.id"))
+    data_validacao = db.Column(db.DateTime(timezone=True))
+    responsavel_id = db.Column(db.Integer, db.ForeignKey("responsaveis.id"))
+    responsavel_pin = db.Column(db.String) # Mantido por compatibilidade, mas idealmente não seria necessário
+    preco_medio = db.Column(db.Float)
+
+    validador = db.relationship("Usuario", foreign_keys=[validador_id])
+
+# --- NOVO MODELO PARA TOKEN MERCADO LIVRE --- 
+class MercadoLivreToken(db.Model):
+    __tablename__ = "mercado_livre_token"
+    # Usar um ID fixo (1) para garantir que sempre haja apenas uma linha
+    # Isso simplifica o carregamento e salvamento, sempre atualizamos a linha 1.
+    id = db.Column(db.Integer, primary_key=True, default=1)
+    access_token = db.Column(db.String, nullable=False)
+    refresh_token = db.Column(db.String, nullable=False)
+    expires_at = db.Column(db.DateTime(timezone=True), nullable=False) # Timestamp de expiração
+    obtained_at = db.Column(db.DateTime(timezone=True), nullable=False) # Quando foi obtido/atualizado
+
+# --- Funções de Gerenciamento de Token (Agora usando DB) --- 
+
+def save_token_data_db(token_data):
+    """
+    Salva ou atualiza os dados do token do Mercado Livre no banco de dados.
+    Calcula e armazena o timestamp de expiração.
+    """
     try:
-        with get_db_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute("PRAGMA foreign_keys = ON;")
-            # Criar tabela usuarios se não existir
-            cursor.execute("""
-            CREATE TABLE IF NOT EXISTS usuarios (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                nome TEXT NOT NULL UNIQUE,
-                senha_hash TEXT NOT NULL,
-                admin INTEGER DEFAULT 0
-            );
-            """)
-            # Criar tabela responsaveis se não existir
-            cursor.execute("""
-            CREATE TABLE IF NOT EXISTS responsaveis (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                nome TEXT NOT NULL UNIQUE,
-                pin TEXT NOT NULL
-            );
-            """)
-            # Criar tabela produtos se não existir
-            cursor.execute("""
-            CREATE TABLE IF NOT EXISTS produtos (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                ean TEXT NOT NULL,
-                nome TEXT NOT NULL,
-                cor TEXT,
-                voltagem TEXT,
-                modelo TEXT,
-                quantidade INTEGER NOT NULL,
-                usuario_id INTEGER NOT NULL,
-                timestamp TEXT,
-                enviado INTEGER DEFAULT 0,
-                data_envio TEXT,
-                validado INTEGER DEFAULT 0,
-                validador_id INTEGER,
-                data_validacao TEXT,
-                responsavel_id INTEGER,
-                responsavel_pin TEXT,
-                preco_medio REAL, 
-                FOREIGN KEY (usuario_id) REFERENCES usuarios (id),
-                FOREIGN KEY (validador_id) REFERENCES usuarios (id),
-                FOREIGN KEY (responsavel_id) REFERENCES responsaveis (id)
-            );
-            """)
+        expires_in = token_data.get("expires_in", 21600) # Padrão 6 horas
+        # Calcula o tempo de expiração a partir de AGORA
+        expires_at_dt = datetime.now(timezone.utc) + timedelta(seconds=expires_in)
+        obtained_at_dt = datetime.now(timezone.utc)
+        
+        access_token = token_data.get("access_token")
+        refresh_token = token_data.get("refresh_token")
+
+        if not access_token or not refresh_token:
+            logger.error("Tentativa de salvar token inválido (sem access ou refresh token).")
+            return False
+
+        # Tenta encontrar o token existente (deve ser sempre ID 1)
+        token_entry = db.session.get(MercadoLivreToken, 1)
+        
+        if token_entry:
+            logger.info("Atualizando token existente no banco de dados.")
+            token_entry.access_token = access_token
+            token_entry.refresh_token = refresh_token
+            token_entry.expires_at = expires_at_dt
+            token_entry.obtained_at = obtained_at_dt
+        else:
+            logger.info("Inserindo novo token no banco de dados (ID=1).")
+            token_entry = MercadoLivreToken(
+                id=1,
+                access_token=access_token,
+                refresh_token=refresh_token,
+                expires_at=expires_at_dt,
+                obtained_at=obtained_at_dt
+            )
+            db.session.add(token_entry)
             
-            # Verificar e adicionar colunas ausentes na tabela produtos (migração)
-            cursor.execute("PRAGMA table_info(produtos)")
-            columns = [column[1] for column in cursor.fetchall()]
-            if "responsavel_id" not in columns:
-                logger.info("Adicionando coluna 'responsavel_id' à tabela produtos...")
-                cursor.execute("ALTER TABLE produtos ADD COLUMN responsavel_id INTEGER REFERENCES responsaveis(id)")
-            if "responsavel_pin" not in columns:
-                logger.info("Adicionando coluna 'responsavel_pin' à tabela produtos...")
-                cursor.execute("ALTER TABLE produtos ADD COLUMN responsavel_pin TEXT")
-            if "preco_medio" not in columns:
-                logger.info("Adicionando coluna 'preco_medio' à tabela produtos...")
-                cursor.execute("ALTER TABLE produtos ADD COLUMN preco_medio REAL")
+        db.session.commit()
+        logger.info(f"Dados do token ML salvos/atualizados no DB. Válido até {expires_at_dt.isoformat()}")
+        return True
+    except Exception as e:
+        db.session.rollback() # Desfaz a transação em caso de erro
+        logger.error(f"Erro ao salvar/atualizar token ML no banco de dados: {str(e)}", exc_info=True)
+        return False
 
-            # Verificar e inserir usuário admin padrão se não existir
-            cursor.execute("SELECT COUNT(*) FROM usuarios WHERE nome = ?", ("admin",))
-            admin_exists = cursor.fetchone()[0]
-            if admin_exists == 0:
-                admin_hash = generate_password_hash("admin")
-                cursor.execute("INSERT INTO usuarios (nome, senha_hash, admin) VALUES (?, ?, ?)", 
-                              ("admin", admin_hash, 1))
-                logger.info("Usuário admin padrão criado.")
-
-            # Inicializar responsáveis se a tabela estiver vazia
-            inicializar_responsaveis(conn)
-            conn.commit()
-            logger.info("Banco de dados SQLite inicializado/verificado com sucesso.")
-    except sqlite3.Error as e:
-        logger.error(f"Erro CRÍTICO ao inicializar o banco de dados SQLite: {e}", exc_info=True)
-        # Em um app real, talvez parar a aplicação aqui?
-
-def inicializar_responsaveis(conn):
+def load_token_data_db():
+    """
+    Carrega os dados do token do banco de dados (espera-se que esteja na linha com ID=1).
+    Retorna um dicionário com os dados ou None se não encontrado ou erro.
+    """
     try:
-        cursor = conn.cursor()
-        cursor.execute("SELECT COUNT(*) FROM responsaveis")
-        count = cursor.fetchone()[0]
-        if count == 0:
-            responsaveis = [
-                ("Liliane", "5584"), ("Rogerio", "9841"),
-                ("Celso", "2122"), ("Marcos", "6231")
-            ]
-            cursor.executemany("INSERT INTO responsaveis (nome, pin) VALUES (?, ?)", responsaveis)
-            logger.info(f"Responsáveis inicializados: {len(responsaveis)}")
-    except sqlite3.Error as e:
-        logger.error(f"Erro ao inicializar responsáveis: {e}")
+        # Busca o token com ID 1
+        token_entry = db.session.get(MercadoLivreToken, 1)
+        
+        if token_entry:
+            # Converte para um dicionário compatível com o código existente
+            token_data = {
+                "access_token": token_entry.access_token,
+                "refresh_token": token_entry.refresh_token,
+                # Converter expires_at (datetime) para timestamp Unix (float) para compatibilidade
+                "expires_at": token_entry.expires_at.timestamp(), 
+                "obtained_at": token_entry.obtained_at.timestamp()
+            }
+            logger.info(f"Dados do token ML carregados do DB. Expira em: {token_entry.expires_at.isoformat()}")
+            return token_data
+        else:
+            logger.warning("Nenhum registro de token ML encontrado no banco de dados (ID=1).")
+            return None
+    except Exception as e:
+        logger.error(f"Erro ao carregar token ML do banco de dados: {str(e)}", exc_info=True)
+        return None
+
+def get_valid_access_token_db():
+    """
+    Obtém um access token válido do DB, atualizando-o via refresh token se necessário.
+    Retorna o access_token ou None.
+    """
+    token_data = load_token_data_db()
+    if not token_data:
+        logger.info("Nenhum dado de token ML encontrado no DB. Autorização inicial necessária.")
+        return None
+
+    current_time = time.time() # Timestamp Unix atual
+    expires_at_ts = token_data.get("expires_at", 0)
+
+    # Verifica se o token atual ainda é válido (com margem de 5 minutos)
+    if current_time < expires_at_ts - 300:
+        logger.info("Usando token de acesso existente do DB.")
+        return token_data.get("access_token")
+
+    # Se expirado, tenta usar o refresh token
+    logger.info("Token de acesso do DB expirado. Tentando atualizar usando refresh token.")
+    refresh_token = token_data.get("refresh_token")
+    if not refresh_token:
+        logger.error("Refresh token não encontrado no DB. É necessário reautorizar a aplicação.")
+        # Opcional: Deletar a entrada inválida do DB?
+        # token_entry = db.session.get(MercadoLivreToken, 1)
+        # if token_entry: 
+        #     db.session.delete(token_entry)
+        #     db.session.commit()
+        return None
+
+    # Chama a função original do módulo ML para fazer o refresh
+    new_token_data = ml_refresh_access_token(refresh_token)
+    
+    if new_token_data:
+        # Salva o novo token no DB
+        if save_token_data_db(new_token_data):
+            logger.info("Token de acesso atualizado e salvo no DB com sucesso.")
+            return new_token_data.get("access_token")
+        else:
+            logger.error("Falha ao salvar o token atualizado no DB.")
+            return None 
+    else:
+        logger.error("Falha ao atualizar o token de acesso usando refresh token (API ML falhou). É necessário reautorizar.")
+        # O refresh token pode ter sido revogado ou expirado.
+        # Opcional: Deletar a entrada inválida do DB?
+        return None
+
+# --- FIM Funções Token DB --- 
+
+# --- Funções de Banco de Dados (Antigas - Adaptar ou Remover) --- 
+# A função get_db_connection original era para SQLite. 
+# Com SQLAlchemy, usamos db.session diretamente.
+# Manter init_database para criar tabelas se não existirem.
+
+def init_database_sqla():
+    """Cria todas as tabelas definidas nos modelos SQLAlchemy se não existirem."""
+    try:
+        with app.app_context(): # Garante que estamos no contexto da aplicação
+            logger.info("Verificando/Criando tabelas do banco de dados com SQLAlchemy...")
+            db.create_all() # Cria tabelas: usuarios, responsaveis, produtos, mercado_livre_token
+            logger.info("Tabelas verificadas/criadas.")
+            
+            # Inicializar dados padrão (admin, responsáveis) se necessário
+            # Verificar admin
+            admin_user = db.session.query(Usuario).filter_by(nome="admin").first()
+            if not admin_user:
+                admin_hash = generate_password_hash("admin")
+                admin_user = Usuario(nome="admin", senha_hash=admin_hash, admin=True)
+                db.session.add(admin_user)
+                logger.info("Usuário admin padrão criado.")
+            
+            # Verificar responsáveis
+            if db.session.query(Responsavel).count() == 0:
+                responsaveis_data = [
+                    {"nome": "Liliane", "pin": "5584"}, {"nome": "Rogerio", "pin": "9841"},
+                    {"nome": "Celso", "pin": "2122"}, {"nome": "Marcos", "pin": "6231"}
+                ]
+                for r_data in responsaveis_data:
+                    resp = Responsavel(nome=r_data["nome"], pin=r_data["pin"])
+                    db.session.add(resp)
+                logger.info(f"Responsáveis inicializados: {len(responsaveis_data)}")
+            
+            db.session.commit()
+            logger.info("Banco de dados (SQLAlchemy) inicializado/verificado com sucesso.")
+            
+    except Exception as e:
+        db.session.rollback()
+        logger.error(f"Erro CRÍTICO ao inicializar o banco de dados com SQLAlchemy: {e}", exc_info=True)
+        # Considerar parar a aplicação
 
 # --- Forçar inicialização do DB ao iniciar a aplicação --- 
-init_database()
+init_database_sqla()
 # --------------------------------------------------------
 
 # Registrar filtro Jinja2 (mantido)
 @app.template_filter("data_brasileira")
 def data_brasileira_filter(data):
+    # ... (código do filtro mantido igual) ...
     if isinstance(data, str):
         try:
             # Tenta converter de ISO format com ou sem Z
@@ -161,645 +295,310 @@ def data_brasileira_filter(data):
          return formatar_data_brasileira(data)
     return data # Retorna como está se não for string nem datetime
 
-# --- Funções de Responsáveis e Usuários (mantidas como no original) ---
+# --- Funções de Responsáveis e Usuários (Adaptadas para SQLAlchemy) --- 
 def obter_responsaveis():
     try:
-        with get_db_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute("SELECT id, nome FROM responsaveis ORDER BY nome")
-            return [dict(row) for row in cursor.fetchall()]
-    except sqlite3.Error as e:
-        logger.error(f"Erro ao obter responsáveis: {e}")
+        responsaveis = db.session.query(Responsavel.id, Responsavel.nome).order_by(Responsavel.nome).all()
+        # Converter para lista de dicionários para manter compatibilidade com o template
+        return [{"id": r.id, "nome": r.nome} for r in responsaveis]
+    except Exception as e:
+        logger.error(f"Erro ao obter responsáveis (SQLAlchemy): {e}")
         return []
 
 def verificar_pin_responsavel(responsavel_id, pin):
     try:
-        with get_db_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute("SELECT pin FROM responsaveis WHERE id = ?", (responsavel_id,))
-            resultado = cursor.fetchone()
-            return bool(resultado and resultado["pin"] == pin)
-    except sqlite3.Error as e:
-        logger.error(f"Erro ao verificar PIN do responsável: {e}")
+        responsavel = db.session.get(Responsavel, responsavel_id)
+        return bool(responsavel and responsavel.pin == pin)
+    except Exception as e:
+        logger.error(f"Erro ao verificar PIN do responsável (SQLAlchemy): {e}")
         return False
 
 def obter_nome_responsavel(responsavel_id):
     try:
-        with get_db_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute("SELECT nome FROM responsaveis WHERE id = ?", (responsavel_id,))
-            resultado = cursor.fetchone()
-            return resultado["nome"] if resultado else None
-    except sqlite3.Error as e:
-        logger.error(f"Erro ao obter nome do responsável: {e}")
+        responsavel = db.session.get(Responsavel, responsavel_id)
+        return responsavel.nome if responsavel else None
+    except Exception as e:
+        logger.error(f"Erro ao obter nome do responsável (SQLAlchemy): {e}")
         return None
 
 def registrar_usuario(nome, senha):
     try:
-        with get_db_connection() as conn:
-            cursor = conn.cursor()
-            senha_hash = generate_password_hash(senha)
-            cursor.execute("INSERT INTO usuarios (nome, senha_hash) VALUES (?, ?)", (nome, senha_hash))
-            conn.commit()
+        # Verifica se já existe
+        if db.session.query(Usuario).filter_by(nome=nome).first():
+            logger.warning(f"Tentativa de registrar usuário existente: {nome}")
+            return False
+            
+        senha_hash = generate_password_hash(senha)
+        novo_usuario = Usuario(nome=nome, senha_hash=senha_hash)
+        db.session.add(novo_usuario)
+        db.session.commit()
         return True
-    except sqlite3.IntegrityError:
-        logger.warning(f"Tentativa de registrar usuário existente: {nome}")
-        return False
-    except sqlite3.Error as e:
-        logger.error(f"Erro ao registrar usuário: {e}")
+    except Exception as e:
+        db.session.rollback()
+        logger.error(f"Erro ao registrar usuário (SQLAlchemy): {e}")
         return False
 
 def verificar_usuario(nome, senha):
     try:
-        with get_db_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute("SELECT * FROM usuarios WHERE nome = ?", (nome,))
-            usuario = cursor.fetchone()
-        if usuario and check_password_hash(usuario["senha_hash"], senha):
-            return dict(usuario)
+        usuario = db.session.query(Usuario).filter_by(nome=nome).first()
+        if usuario and check_password_hash(usuario.senha_hash, senha):
+            # Retorna um dicionário para manter compatibilidade com o código que usa session
+            return {
+                "id": usuario.id,
+                "nome": usuario.nome,
+                "admin": usuario.admin
+            }
         return None
-    except sqlite3.Error as e:
-        logger.error(f"Erro ao verificar usuário: {e}")
+    except Exception as e:
+        logger.error(f"Erro ao verificar usuário (SQLAlchemy): {e}")
         return None
 
 def obter_nome_usuario(usuario_id):
     try:
-        with get_db_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute("SELECT nome FROM usuarios WHERE id = ?", (usuario_id,))
-            usuario = cursor.fetchone()
-        return usuario["nome"] if usuario else None
-    except sqlite3.Error as e:
-        logger.error(f"Erro ao obter nome do usuário: {e}")
+        usuario = db.session.get(Usuario, usuario_id)
+        return usuario.nome if usuario else None
+    except Exception as e:
+        logger.error(f"Erro ao obter nome do usuário (SQLAlchemy): {e}")
         return None
 
-# --- Funções de Produtos (mantidas, salvar_produto usa preco_medio) ---
+# --- Funções de Produtos (Adaptadas para SQLAlchemy) --- 
 def carregar_produtos_usuario(usuario_id, apenas_nao_enviados=False):
     try:
-        with get_db_connection() as conn:
-            cursor = conn.cursor()
-            sql = "SELECT * FROM produtos WHERE usuario_id = ?" + (" AND enviado = 0" if apenas_nao_enviados else "") + " ORDER BY timestamp DESC"
-            cursor.execute(sql, (usuario_id,))
-            return [dict(row) for row in cursor.fetchall()]
-    except sqlite3.Error as e:
-        logger.error(f"Erro ao carregar produtos do usuário {usuario_id}: {e}")
+        query = db.session.query(Produto).filter_by(usuario_id=usuario_id)
+        if apenas_nao_enviados:
+            query = query.filter_by(enviado=False)
+        produtos = query.order_by(Produto.timestamp.desc()).all()
+        # Converter para lista de dicionários
+        return [p.__dict__ for p in produtos] # Simplificado, pode precisar ajustar chaves _sa_instance_state
+    except Exception as e:
+        logger.error(f"Erro ao carregar produtos do usuário {usuario_id} (SQLAlchemy): {e}")
         return []
 
 def carregar_todas_listas_enviadas():
     try:
-        with get_db_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute("""
-            SELECT p.*, u.nome as nome_usuario, v.nome as nome_validador, r.nome as nome_responsavel
-            FROM produtos p JOIN usuarios u ON p.usuario_id = u.id 
-            LEFT JOIN usuarios v ON p.validador_id = v.id
-            LEFT JOIN responsaveis r ON p.responsavel_id = r.id
-            WHERE p.enviado = 1 ORDER BY p.data_envio DESC
-            """)
-            return [dict(row) for row in cursor.fetchall()]
-    except sqlite3.Error as e:
-        logger.error(f"Erro ao carregar todas as listas enviadas: {e}")
+        # Usar join para buscar nomes relacionados
+        produtos = db.session.query(Produto, Usuario.nome.label("nome_usuario"), 
+                                  Responsavel.nome.label("nome_responsavel")) \
+                    .join(Usuario, Produto.usuario_id == Usuario.id) \
+                    .outerjoin(Responsavel, Produto.responsavel_id == Responsavel.id) \
+                    .filter(Produto.enviado == True) \
+                    .order_by(Produto.data_envio.desc()).all()
+        
+        # Converter para lista de dicionários
+        result_list = []
+        for produto, nome_usuario, nome_responsavel in produtos:
+            p_dict = produto.__dict__.copy()
+            p_dict.pop("_sa_instance_state", None) # Remover estado SQLAlchemy
+            p_dict["nome_usuario"] = nome_usuario
+            p_dict["nome_responsavel"] = nome_responsavel
+            # Adicionar nome do validador se existir (requer outro join ou busca separada)
+            p_dict["nome_validador"] = obter_nome_usuario(produto.validador_id) if produto.validador_id else None
+            result_list.append(p_dict)
+        return result_list
+    except Exception as e:
+        logger.error(f"Erro ao carregar todas as listas enviadas (SQLAlchemy): {e}")
         return []
 
 def pesquisar_produtos(termo_pesquisa):
     try:
-        with get_db_connection() as conn:
-            cursor = conn.cursor()
-            termo_like = f"%{termo_pesquisa}%"
-            cursor.execute("""
-            SELECT p.*, u.nome as nome_usuario, v.nome as nome_validador, r.nome as nome_responsavel
-            FROM produtos p JOIN usuarios u ON p.usuario_id = u.id 
-            LEFT JOIN usuarios v ON p.validador_id = v.id
-            LEFT JOIN responsaveis r ON p.responsavel_id = r.id
-            WHERE p.enviado = 1 AND (LOWER(p.ean) LIKE LOWER(?) OR LOWER(p.nome) LIKE LOWER(?) OR LOWER(p.cor) LIKE LOWER(?) OR LOWER(p.modelo) LIKE LOWER(?))
-            ORDER BY p.data_envio DESC
-            """, (termo_like, termo_like, termo_like, termo_like))
-            return [dict(row) for row in cursor.fetchall()]
-    except sqlite3.Error as e:
-        logger.error(f"Erro ao pesquisar produtos: {e}")
+        termo_like = f"%{termo_pesquisa.lower()}%"
+        produtos = db.session.query(Produto, Usuario.nome.label("nome_usuario"), 
+                                  Responsavel.nome.label("nome_responsavel")) \
+                    .join(Usuario, Produto.usuario_id == Usuario.id) \
+                    .outerjoin(Responsavel, Produto.responsavel_id == Responsavel.id) \
+                    .filter(Produto.enviado == True) \
+                    .filter(
+                        db.or_(
+                            db.func.lower(Produto.ean).like(termo_like),
+                            db.func.lower(Produto.nome).like(termo_like),
+                            db.func.lower(Produto.cor).like(termo_like),
+                            db.func.lower(Produto.modelo).like(termo_like)
+                        )
+                    ) \
+                    .order_by(Produto.data_envio.desc()).all()
+        
+        # Converter para lista de dicionários (similar a carregar_todas_listas_enviadas)
+        result_list = []
+        for produto, nome_usuario, nome_responsavel in produtos:
+             p_dict = produto.__dict__.copy()
+             p_dict.pop("_sa_instance_state", None)
+             p_dict["nome_usuario"] = nome_usuario
+             p_dict["nome_responsavel"] = nome_responsavel
+             p_dict["nome_validador"] = obter_nome_usuario(produto.validador_id) if produto.validador_id else None
+             result_list.append(p_dict)
+        return result_list
+    except Exception as e:
+        logger.error(f"Erro ao pesquisar produtos (SQLAlchemy): {e}")
         return []
 
 def buscar_produto_local(ean, usuario_id):
     try:
-        with get_db_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute("SELECT * FROM produtos WHERE ean = ? AND usuario_id = ? AND enviado = 0", (ean, usuario_id))
-            produto = cursor.fetchone()
-        return dict(produto) if produto else None
-    except sqlite3.Error as e:
-        logger.error(f"Erro ao buscar produto local para EAN {ean}, usuário {usuario_id}: {e}")
+        produto = db.session.query(Produto).filter_by(ean=ean, usuario_id=usuario_id, enviado=False).first()
+        return produto.__dict__ if produto else None # Retorna dict ou None
+    except Exception as e:
+        logger.error(f"Erro ao buscar produto local EAN {ean}, usuário {usuario_id} (SQLAlchemy): {e}")
         return None
 
-def salvar_produto(produto, usuario_id):
+def salvar_produto(produto_data, usuario_id):
+    """ Salva ou atualiza um produto usando SQLAlchemy. produto_data é um dicionário. """
     try:
-        with get_db_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute("SELECT id, quantidade FROM produtos WHERE ean = ? AND usuario_id = ? AND enviado = 0", (produto['ean'], usuario_id))
-            existing = cursor.fetchone()
+        ean = produto_data["ean"]
+        quantidade_adicionar = produto_data["quantidade"]
+        
+        # Busca produto existente não enviado
+        produto_existente = db.session.query(Produto).filter_by(ean=ean, usuario_id=usuario_id, enviado=False).first()
+        
+        timestamp_obj = datetime.now(timezone.utc)
+        preco_medio = produto_data.get("preco_medio")
+
+        if produto_existente:
+            logger.info(f"Atualizando produto existente (ID: {produto_existente.id}) EAN: {ean} para usuário {usuario_id}.")
+            produto_existente.quantidade += quantidade_adicionar
+            produto_existente.timestamp = timestamp_obj
+            # Atualiza outros campos se necessário (nome, cor, etc.)?
+            produto_existente.nome = produto_data["nome"]
+            produto_existente.cor = produto_data.get("cor")
+            produto_existente.voltagem = produto_data.get("voltagem")
+            produto_existente.modelo = produto_data.get("modelo")
+            produto_existente.preco_medio = preco_medio
+        else:
+            logger.info(f"Inserindo novo produto EAN: {ean} para usuário {usuario_id}.")
+            novo_produto = Produto(
+                ean=ean,
+                nome=produto_data["nome"],
+                cor=produto_data.get("cor"),
+                voltagem=produto_data.get("voltagem"),
+                modelo=produto_data.get("modelo"),
+                quantidade=quantidade_adicionar,
+                usuario_id=usuario_id,
+                timestamp=timestamp_obj,
+                enviado=False,
+                preco_medio=preco_medio
+            )
+            db.session.add(novo_produto)
             
-            # Garante que o timestamp seja sempre um objeto datetime antes de formatar
-            timestamp_obj = produto.get("timestamp")
-            if not isinstance(timestamp_obj, datetime):
-                 timestamp_obj = datetime.now(timezone.utc)
-            timestamp_str = timestamp_obj.isoformat()
-
-            preco_medio = produto.get("preco_medio")
-
-            if existing:
-                nova_quantidade = existing["quantidade"] + produto["quantidade"]
-                logger.info(f"Atualizando produto existente (ID: {existing['id']}) EAN: {produto['ean']} para usuário {usuario_id}. Nova quantidade: {nova_quantidade}")
-                cursor.execute("UPDATE produtos SET quantidade = ?, timestamp = ?, preco_medio = ? WHERE id = ?",
-                               (nova_quantidade, timestamp_str, preco_medio, existing["id"]))
-            else:
-                logger.info(f"Inserindo novo produto EAN: {produto['ean']} para usuário {usuario_id}.")
-                cursor.execute("INSERT INTO produtos (ean, nome, cor, voltagem, modelo, quantidade, usuario_id, timestamp, enviado, preco_medio) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?)",
-                               (produto['ean'], produto["nome"], produto.get("cor"), produto.get("voltagem"), produto.get("modelo"), produto["quantidade"], usuario_id, timestamp_str, preco_medio))
-            conn.commit()
+        db.session.commit()
         return True
-    except sqlite3.Error as e:
-        logger.error(f"Erro de banco de dados ao salvar produto EAN {produto.get('ean')} para usuário {usuario_id}: {e}")
-        return False
     except Exception as e:
-        logger.error(f"Erro inesperado ao salvar produto EAN {produto.get('ean')} para usuário {usuario_id}: {e}", exc_info=True)
+        db.session.rollback()
+        logger.error(f"Erro ao salvar produto EAN {produto_data.get("ean")} (SQLAlchemy): {e}", exc_info=True)
         return False
 
 def enviar_lista_produtos(usuario_id, responsavel_id, pin):
     try:
         if not verificar_pin_responsavel(responsavel_id, pin):
-            logger.warning(f"PIN inválido para o responsável ID {responsavel_id} ao tentar enviar lista do usuário {usuario_id}.")
+            logger.warning(f"PIN inválido para responsável ID {responsavel_id} ao enviar lista do usuário {usuario_id}.")
             return None # PIN inválido
         
-        with get_db_connection() as conn:
-            cursor = conn.cursor()
-            data_envio_str = datetime.now(timezone.utc).isoformat()
-            cursor.execute("UPDATE produtos SET enviado = 1, data_envio = ?, responsavel_id = ?, responsavel_pin = ? WHERE usuario_id = ? AND enviado = 0",
-                           (data_envio_str, responsavel_id, pin, usuario_id))
-            affected_rows = cursor.rowcount
-            if affected_rows == 0:
-                 logger.warning(f"Nenhum produto não enviado encontrado para o usuário {usuario_id} ao tentar enviar.")
-                 return "nenhum_produto" # Indica que não havia produtos para enviar
-            conn.commit()
-            logger.info(f"Produtos marcados como enviados para usuário {usuario_id}: {affected_rows}. Responsável: {responsavel_id}")
-            return data_envio_str # Sucesso, retorna data de envio
-    except sqlite3.Error as e:
-        logger.error(f"Erro de banco de dados ao enviar lista de produtos do usuário {usuario_id}: {e}")
-        return "erro_db"
+        data_envio_dt = datetime.now(timezone.utc)
+        
+        # Atualiza produtos não enviados do usuário
+        update_result = db.session.query(Produto) \
+            .filter_by(usuario_id=usuario_id, enviado=False) \
+            .update({
+                Produto.enviado: True,
+                Produto.data_envio: data_envio_dt,
+                Produto.responsavel_id: responsavel_id,
+                Produto.responsavel_pin: pin
+            }, synchronize_session=False) # Importante para update em massa
+            
+        db.session.commit()
+        
+        affected_rows = update_result # .rowcount não funciona da mesma forma em SQLAlchemy para todos os backends
+        
+        if affected_rows == 0:
+             logger.warning(f"Nenhum produto não enviado encontrado para usuário {usuario_id} ao tentar enviar.")
+             return "nenhum_produto"
+             
+        logger.info(f"Produtos marcados como enviados para usuário {usuario_id}: {affected_rows}. Responsável: {responsavel_id}")
+        return data_envio_dt.isoformat() # Retorna data como string ISO
+        
     except Exception as e:
-        logger.error(f"Erro inesperado ao enviar lista do usuário {usuario_id}: {e}", exc_info=True)
-        return "erro_inesperado"
+        db.session.rollback()
+        logger.error(f"Erro ao enviar lista de produtos do usuário {usuario_id} (SQLAlchemy): {e}")
+        return "erro_db"
 
 def deletar_produto(produto_id, usuario_id):
     try:
-        with get_db_connection() as conn:
-            cursor = conn.cursor()
-            # Garante que só pode deletar produtos não enviados do próprio usuário
-            cursor.execute("DELETE FROM produtos WHERE id = ? AND usuario_id = ? AND enviado = 0", (produto_id, usuario_id))
-            affected_rows = cursor.rowcount
-            conn.commit()
-            if affected_rows > 0:
-                logger.info(f"Produto ID {produto_id} deletado com sucesso pelo usuário {usuario_id}.")
-                return True
-            else:
-                logger.warning(f"Tentativa de deletar produto ID {produto_id} falhou (não encontrado, já enviado ou pertence a outro usuário). Usuário: {usuario_id}")
-                return False
-    except sqlite3.Error as e:
-        logger.error(f"Erro de banco de dados ao deletar produto ID {produto_id} pelo usuário {usuario_id}: {e}")
+        produto = db.session.query(Produto).filter_by(id=produto_id, usuario_id=usuario_id, enviado=False).first()
+        if produto:
+            db.session.delete(produto)
+            db.session.commit()
+            logger.info(f"Produto ID {produto_id} deletado com sucesso pelo usuário {usuario_id}.")
+            return True
+        else:
+            logger.warning(f"Tentativa de deletar produto ID {produto_id} falhou (não encontrado, já enviado ou pertence a outro usuário). Usuário: {usuario_id}")
+            return False
+    except Exception as e:
+        db.session.rollback()
+        logger.error(f"Erro ao deletar produto ID {produto_id} (SQLAlchemy): {e}")
         return False
 
-def validar_lista(data_envio, validador_id):
+def validar_lista(data_envio_iso, validador_id):
     try:
-        with get_db_connection() as conn:
-            cursor = conn.cursor()
-            data_validacao_str = datetime.now(timezone.utc).isoformat()
-            cursor.execute("UPDATE produtos SET validado = 1, validador_id = ?, data_validacao = ? WHERE data_envio = ? AND enviado = 1",
-                           (validador_id, data_validacao_str, data_envio))
-            affected_rows = cursor.rowcount
-            conn.commit()
-            if affected_rows > 0:
-                logger.info(f"Lista enviada em {data_envio} validada por usuário {validador_id}. {affected_rows} produtos atualizados.")
-                return True
-            else:
-                 logger.warning(f"Nenhum produto encontrado para validar com data de envio {data_envio}.")
-                 return False # Nenhum produto encontrado com essa data de envio
-    except sqlite3.Error as e:
-        logger.error(f"Erro de banco de dados ao validar lista enviada em {data_envio} por usuário {validador_id}: {e}")
+        # Converte a string ISO de volta para datetime
+        data_envio_dt = datetime.fromisoformat(data_envio_iso)
+        data_validacao_dt = datetime.now(timezone.utc)
+        
+        update_result = db.session.query(Produto) \
+            .filter(Produto.data_envio == data_envio_dt, Produto.enviado == True) \
+            .update({
+                Produto.validado: True,
+                Produto.validador_id: validador_id,
+                Produto.data_validacao: data_validacao_dt
+            }, synchronize_session=False)
+            
+        db.session.commit()
+        affected_rows = update_result
+        
+        if affected_rows > 0:
+            logger.info(f"Lista enviada em {data_envio_iso} validada por usuário {validador_id}. {affected_rows} produtos atualizados.")
+            return True
+        else:
+             logger.warning(f"Nenhum produto encontrado para validar com data de envio {data_envio_iso}.")
+             return False
+             
+    except Exception as e:
+        db.session.rollback()
+        logger.error(f"Erro ao validar lista enviada em {data_envio_iso} (SQLAlchemy): {e}")
         return False
 
-def obter_produtos_por_data_envio(data_envio):
+def obter_produtos_por_data_envio(data_envio_iso):
     try:
-        with get_db_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute("""
-                SELECT p.*, u.nome as nome_usuario, v.nome as nome_validador, r.nome as nome_responsavel
-                FROM produtos p JOIN usuarios u ON p.usuario_id = u.id 
-                LEFT JOIN usuarios v ON p.validador_id = v.id
-                LEFT JOIN responsaveis r ON p.responsavel_id = r.id
-                WHERE p.data_envio = ? AND p.enviado = 1
-                ORDER BY p.nome
-            """, (data_envio,))
-            return [dict(row) for row in cursor.fetchall()]
-    except sqlite3.Error as e:
-        logger.error(f"Erro ao obter produtos pela data de envio {data_envio}: {e}")
+        data_envio_dt = datetime.fromisoformat(data_envio_iso)
+        # Similar a carregar_todas_listas_enviadas, mas filtrando por data_envio
+        produtos = db.session.query(Produto, Usuario.nome.label("nome_usuario"), 
+                                  Responsavel.nome.label("nome_responsavel")) \
+                    .join(Usuario, Produto.usuario_id == Usuario.id) \
+                    .outerjoin(Responsavel, Produto.responsavel_id == Responsavel.id) \
+                    .filter(Produto.data_envio == data_envio_dt, Produto.enviado == True) \
+                    .order_by(Produto.nome).all()
+        
+        # Converter para lista de dicionários
+        result_list = []
+        for produto, nome_usuario, nome_responsavel in produtos:
+             p_dict = produto.__dict__.copy()
+             p_dict.pop("_sa_instance_state", None)
+             p_dict["nome_usuario"] = nome_usuario
+             p_dict["nome_responsavel"] = nome_responsavel
+             p_dict["nome_validador"] = obter_nome_usuario(produto.validador_id) if produto.validador_id else None
+             result_list.append(p_dict)
+        return result_list
+    except Exception as e:
+        logger.error(f"Erro ao obter produtos pela data de envio {data_envio_iso} (SQLAlchemy): {e}")
         return []
 
-# --- Rotas da Aplicação --- 
+# --- Rotas da Aplicação (Adaptadas para SQLAlchemy e Token DB) --- 
 
-@app.route('/login', methods=['GET', 'POST'])
+@app.route("/login", methods=["GET", "POST"])
 def login():
-    if request.method == 'POST':
-        nome = request.form['nome']
-        senha = request.form['senha']
-        usuario = verificar_usuario(nome, senha)
+    if request.method == "POST":
+        nome = request.form["nome"]
+        senha = request.form["senha"]
+        usuario = verificar_usuario(nome, senha) # Já adaptado para SQLAlchemy
         if usuario:
-            session['user_id'] = usuario['id']
-            session['user_name'] = usuario['nome']
-            session['is_admin'] = bool(usuario['admin'])
-            logger.info(f"Usuário '{nome}' (ID: {usuario['id']}, Admin: {session['is_admin']}) logado com sucesso.")
-            flash('Login bem-sucedido!', 'success')
-            return redirect(url_for('index'))
-        else:
-            logger.warning(f"Tentativa de login falhou para o usuário '{nome}'.")
-            flash('Nome de usuário ou senha inválidos.', 'danger')
-    # Se GET ou login falhou, renderiza a página de login
-    return render_template('login.html')
-
-@app.route('/logout')
-def logout():
-    user_name = session.get('user_name', 'Desconhecido')
-    session.clear()
-    logger.info(f"Usuário '{user_name}' deslogado.")
-    flash('Você foi desconectado.', 'info')
-    return redirect(url_for('login'))
-
-@app.route('/register', methods=['GET', 'POST'])
-def register():
-    # Simples verificação se o usuário já está logado, redireciona se estiver
-    if 'user_id' in session:
-        return redirect(url_for('index'))
-        
-    if request.method == 'POST':
-        nome = request.form['nome']
-        senha = request.form['senha']
-        # Validação básica (poderia ser mais robusta)
-        if not nome or not senha:
-            flash('Nome de usuário e senha são obrigatórios.', 'warning')
-        elif registrar_usuario(nome, senha):
-            logger.info(f"Novo usuário registrado: '{nome}'.")
-            flash('Registro bem-sucedido! Faça o login.', 'success')
-            return redirect(url_for('login'))
-        else:
-            logger.warning(f"Falha ao registrar usuário '{nome}' (provavelmente já existe).")
-            flash('Nome de usuário já existe.', 'danger')
-            
-    # Se GET ou registro falhou, renderiza a página de registro
-    return render_template('register.html')
-
-@app.route('/')
-def index():
-    if 'user_id' not in session:
-        return redirect(url_for('login'))
-        
-    user_id = session['user_id']
-    produtos = carregar_produtos_usuario(user_id, apenas_nao_enviados=True)
-    responsaveis = obter_responsaveis()
-    
-    # Verifica se a integração com ML está autorizada
-    ml_authorized = os.path.exists(TOKEN_FILE_PATH) and load_token_data() is not None
-    
-    return render_template('index.html', produtos=produtos, responsaveis=responsaveis, ml_authorized=ml_authorized)
-
-# --- ROTAS DE AUTORIZAÇÃO MERCADO LIVRE --- 
-
-@app.route('/ml_authorize')
-def ml_authorize():
-    # Verifica se o usuário está logado (opcional, mas recomendado)
-    if 'user_id' not in session:
-        flash('Faça login para autorizar a integração com o Mercado Livre.', 'warning')
-        return redirect(url_for('login'))
-        
-    auth_url = get_authorization_url()
-    if auth_url:
-        logger.info(f"Redirecionando usuário {session.get('user_name')} para autorização no Mercado Livre.")
-        return redirect(auth_url)
-    else:
-        logger.error("Não foi possível gerar a URL de autorização do ML. Verifique as credenciais no servidor.")
-        flash('Erro ao iniciar autorização com o Mercado Livre. Contate o administrador.', 'danger')
-        return redirect(url_for('index'))
-
-@app.route('/ml_callback')
-def ml_callback():
-    # Verifica se o usuário está logado (opcional)
-    # if 'user_id' not in session:
-    #     flash('Sessão expirada. Faça login novamente.', 'warning')
-    #     return redirect(url_for('login'))
-        
-    authorization_code = request.args.get('code')
-    error = request.args.get('error')
-    error_description = request.args.get('error_description')
-
-    if error:
-        logger.error(f"Erro retornado pelo Mercado Livre durante autorização: {error} - {error_description}")
-        flash(f'Erro na autorização do Mercado Livre: {error_description} ({error})', 'danger')
-        return redirect(url_for('index'))
-
-    if not authorization_code:
-        logger.error("Callback do Mercado Livre recebido sem código de autorização.")
-        flash('Erro na comunicação com o Mercado Livre (código ausente). Tente autorizar novamente.', 'danger')
-        return redirect(url_for('index'))
-
-    logger.info(f"Recebido código de autorização do ML: {authorization_code[:10]}...")
-    
-    # Troca o código pelo token (a função exchange_code_for_token já salva o token)
-    token_data = exchange_code_for_token(authorization_code)
-    
-    if token_data and token_data.get('access_token'):
-        logger.info(f"Autorização com Mercado Livre concluída e token salvo com sucesso.")
-        flash('Integração com o Mercado Livre autorizada com sucesso!', 'success')
-    else:
-        logger.error("Falha ao trocar o código de autorização pelo token ou salvar o token.")
-        flash('Falha ao finalizar a autorização com o Mercado Livre. Verifique os logs do servidor ou tente novamente.', 'danger')
-        
-    return redirect(url_for('index'))
-
-# --- FIM ROTAS ML --- 
-
-@app.route('/buscar_produto', methods=['POST'])
-@app.route('/buscar_ean', methods=['POST']) # Adicionado alias para compatibilidade
-def buscar_produto():
-    if 'user_id' not in session:
-        return jsonify({'success': False, 'message': 'Sessão expirada. Faça login novamente.'}), 401
-        
-    ean = request.form.get('ean')
-    if not ean or not ean.isdigit():
-        return jsonify({'success': False, 'message': 'Código EAN inválido.'}), 400
-        
-    user_id = session['user_id']
-    
-    # 1. Tenta buscar no banco de dados local primeiro
-    produto_local = buscar_produto_local(ean, user_id)
-    if produto_local:
-        logger.info(f"Produto EAN {ean} encontrado localmente para usuário {user_id}.")
-        # Retorna os dados locais, mas indica que foi local
-        return jsonify({
-            'success': True, 
-            'data': produto_local, 
-            'message': 'Produto já existe na sua lista atual.', 
-            'source': 'local'
-        })
-        
-    # 2. Se não encontrou localmente, busca online no Mercado Livre
-    logger.info(f"Produto EAN {ean} não encontrado localmente. Buscando online no Mercado Livre...")
-    
-    # Verifica se a integração ML está autorizada antes de tentar buscar
-    if not os.path.exists(TOKEN_FILE_PATH) or load_token_data() is None:
-         logger.warning(f"Tentativa de busca online do EAN {ean} sem autorização do ML.")
-         return jsonify({
-             'success': False, 
-             'message': 'A integração com o Mercado Livre não está autorizada. Clique em "Autorizar Mercado Livre" primeiro.', 
-             'source': 'auth_required'
-         }), 403 # Forbidden ou Bad Request?
-
-    # Chama a função de busca online (que agora usa OAuth)
-    resultado_online = buscar_produto_online(ean)
-    
-    # Adiciona timestamp da busca ao resultado se bem-sucedido
-    if resultado_online.get('success'):
-        resultado_online['data']['timestamp'] = datetime.now(timezone.utc)
-        logger.info(f"Busca online para EAN {ean} retornou sucesso. Fonte: {resultado_online.get('source')}")
-    else:
-        logger.warning(f"Busca online para EAN {ean} falhou ou não encontrou. Mensagem: {resultado_online.get('message')}")
-
-    # Retorna o resultado da busca online (seja sucesso ou fallback)
-    return jsonify(resultado_online)
-
-@app.route('/adicionar_produto', methods=['POST'])
-def adicionar_produto():
-    if 'user_id' not in session:
-        return jsonify({'success': False, 'message': 'Sessão expirada.'}), 401
-        
-    try:
-        data = request.get_json()
-        logger.debug(f"Recebido para adicionar/atualizar produto: {data}")
-        
-        # Validações básicas
-        if not data or not data.get('ean') or not data.get('nome') or data.get('quantidade') is None:
-            logger.warning(f"Dados inválidos recebidos para adicionar produto: {data}")
-            return jsonify({'success': False, 'message': 'Dados incompletos ou inválidos.'}), 400
-            
-        produto = {
-            'ean': str(data['ean']).strip(),
-            'nome': str(data['nome']).strip(),
-            'cor': str(data.get('cor', '')).strip(),
-            'voltagem': str(data.get('voltagem', '')).strip(),
-            'modelo': str(data.get('modelo', '')).strip(),
-            'quantidade': int(data['quantidade']),
-            'preco_medio': float(data['preco_medio']) if data.get('preco_medio') is not None else None,
-            'timestamp': datetime.now(timezone.utc) # Adiciona timestamp no momento de salvar
-        }
-        
-        # Validação adicional de quantidade
-        if produto['quantidade'] <= 0:
-             logger.warning(f"Quantidade inválida ({produto['quantidade']}) para EAN {produto['ean']}.")
-             return jsonify({'success': False, 'message': 'Quantidade deve ser maior que zero.'}), 400
-
-        user_id = session['user_id']
-        
-        if salvar_produto(produto, user_id):
-            logger.info(f"Produto EAN {produto['ean']} salvo/atualizado com sucesso para usuário {user_id}.")
-            # Recarrega a lista de produtos para retornar ao frontend
-            produtos_atualizados = carregar_produtos_usuario(user_id, apenas_nao_enviados=True)
-            # Renderiza apenas a tabela de produtos como HTML para substituir no frontend
-            tabela_html = render_template('_tabela_produtos.html', produtos=produtos_atualizados, responsaveis=obter_responsaveis()) # Passa responsaveis se necessário no template
-            return jsonify({'success': True, 'message': 'Produto adicionado/atualizado com sucesso!', 'table_html': tabela_html})
-        else:
-            logger.error(f"Falha ao salvar produto EAN {produto['ean']} no banco de dados para usuário {user_id}.")
-            return jsonify({'success': False, 'message': 'Erro ao salvar produto no banco de dados.'}), 500
-            
-    except (ValueError, TypeError) as e:
-        logger.error(f"Erro de tipo/valor ao processar dados para adicionar produto: {e}", exc_info=True)
-        return jsonify({'success': False, 'message': 'Erro nos dados enviados (quantidade ou preço inválido?).'}), 400
-    except Exception as e:
-        logger.error(f"Erro inesperado ao adicionar produto: {e}", exc_info=True)
-        return jsonify({'success': False, 'message': 'Erro interno no servidor.'}), 500
-
-@app.route('/enviar_lista', methods=['POST'])
-def enviar_lista():
-    if 'user_id' not in session:
-        return jsonify({'success': False, 'message': 'Sessão expirada.'}), 401
-        
-    user_id = session['user_id']
-    responsavel_id = request.form.get('responsavel_id')
-    pin = request.form.get('pin')
-    
-    if not responsavel_id or not pin:
-        return jsonify({'success': False, 'message': 'Selecione o responsável e informe o PIN.'}), 400
-        
-    resultado_envio = enviar_lista_produtos(user_id, responsavel_id, pin)
-    
-    if resultado_envio is None: # PIN inválido
-        return jsonify({'success': False, 'message': 'PIN do responsável inválido.'}), 403
-    elif resultado_envio == "nenhum_produto":
-         return jsonify({'success': False, 'message': 'Não há produtos na lista para enviar.'}), 400
-    elif resultado_envio == "erro_db" or resultado_envio == "erro_inesperado":
-        return jsonify({'success': False, 'message': 'Erro ao marcar produtos como enviados no banco de dados.'}), 500
-    else: # Sucesso, resultado_envio contém a data_envio
-        # Recarrega a lista (que agora estará vazia)
-        produtos_atualizados = carregar_produtos_usuario(user_id, apenas_nao_enviados=True)
-        tabela_html = render_template('_tabela_produtos.html', produtos=produtos_atualizados, responsaveis=obter_responsaveis())
-        return jsonify({'success': True, 'message': 'Lista enviada com sucesso!', 'table_html': tabela_html})
-
-@app.route('/deletar_produto/<int:produto_id>', methods=['DELETE'])
-def deletar_produto_route(produto_id):
-    if 'user_id' not in session:
-        return jsonify({'success': False, 'message': 'Sessão expirada.'}), 401
-        
-    user_id = session['user_id']
-    if deletar_produto(produto_id, user_id):
-        logger.info(f"Usuário {user_id} deletou produto ID {produto_id}.")
-        # Recarrega a lista de produtos para retornar ao frontend
-        produtos_atualizados = carregar_produtos_usuario(user_id, apenas_nao_enviados=True)
-        tabela_html = render_template('_tabela_produtos.html', produtos=produtos_atualizados, responsaveis=obter_responsaveis())
-        return jsonify({'success': True, 'message': 'Produto deletado.', 'table_html': tabela_html})
-    else:
-        logger.warning(f"Falha ao deletar produto ID {produto_id} pelo usuário {user_id}.")
-        return jsonify({'success': False, 'message': 'Erro ao deletar produto (pode já ter sido enviado ou não pertence a você).'}), 400
-
-# --- Rotas de Admin --- 
-
-@app.route('/admin')
-def admin():
-    if 'user_id' not in session or not session.get('is_admin'):
-        flash('Acesso não autorizado.', 'danger')
-        return redirect(url_for('login'))
-        
-    listas_enviadas = carregar_todas_listas_enviadas()
-    # Agrupar por data de envio para exibição
-    listas_agrupadas = {}
-    for produto in listas_enviadas:
-        data_envio = produto['data_envio']
-        if data_envio not in listas_agrupadas:
-            listas_agrupadas[data_envio] = {
-                'data_envio': data_envio,
-                'nome_usuario': produto['nome_usuario'],
-                'nome_responsavel': produto['nome_responsavel'],
-                'validado': bool(produto['validado']),
-                'nome_validador': produto['nome_validador'],
-                'data_validacao': produto['data_validacao'],
-                'total_itens': 0,
-                'total_quantidade': 0
-            }
-        listas_agrupadas[data_envio]['total_itens'] += 1
-        listas_agrupadas[data_envio]['total_quantidade'] += produto['quantidade']
-        
-    # Ordenar pela data de envio mais recente
-    listas_ordenadas = sorted(listas_agrupadas.values(), key=lambda x: x['data_envio'], reverse=True)
-    
-    return render_template('admin.html', listas=listas_ordenadas)
-
-@app.route('/admin/validar/<path:data_envio>', methods=['POST'])
-def validar_lista_route(data_envio):
-    if 'user_id' not in session or not session.get('is_admin'):
-        return jsonify({'success': False, 'message': 'Acesso não autorizado.'}), 403
-        
-    validador_id = session['user_id']
-    if validar_lista(data_envio, validador_id):
-        logger.info(f"Admin {session['user_name']} validou a lista enviada em {data_envio}.")
-        flash(f'Lista enviada em {data_brasileira_filter(data_envio)} validada com sucesso!', 'success')
-        return jsonify({'success': True})
-    else:
-        logger.error(f"Admin {session['user_name']} falhou ao validar a lista enviada em {data_envio}.")
-        return jsonify({'success': False, 'message': 'Erro ao validar a lista no banco de dados.'}), 500
-
-@app.route('/admin/detalhes/<path:data_envio>')
-def detalhes_lista(data_envio):
-    if 'user_id' not in session or not session.get('is_admin'):
-        flash('Acesso não autorizado.', 'danger')
-        return redirect(url_for('login'))
-        
-    produtos = obter_produtos_por_data_envio(data_envio)
-    if not produtos:
-        flash('Lista não encontrada ou vazia.', 'warning')
-        return redirect(url_for('admin'))
-        
-    # Pega informações gerais do primeiro produto (usuário, responsável, etc.)
-    info_lista = produtos[0] 
-    
-    return render_template('detalhes_lista.html', produtos=produtos, info_lista=info_lista)
-
-@app.route('/admin/exportar/<path:data_envio>')
-def exportar_lista(data_envio):
-    if 'user_id' not in session or not session.get('is_admin'):
-        flash('Acesso não autorizado.', 'danger')
-        return redirect(url_for('login'))
-        
-    produtos = obter_produtos_por_data_envio(data_envio)
-    if not produtos:
-        flash('Lista não encontrada ou vazia para exportar.', 'warning')
-        return redirect(url_for('admin'))
-        
-    # Preparar dados para DataFrame
-    dados_export = []
-    for p in produtos:
-        dados_export.append({
-            'EAN': p['ean'],
-            'Nome': p['nome'],
-            'Cor': p.get('cor', ''),
-            'Voltagem': p.get('voltagem', ''),
-            'Modelo': p.get('modelo', ''),
-            'Quantidade': p['quantidade'],
-            'Preço Médio ML': p.get('preco_medio'),
-            'Usuário': p['nome_usuario'],
-            'Data Envio': data_brasileira_filter(p['data_envio']),
-            'Responsável Envio': p['nome_responsavel'],
-            'Validado': 'Sim' if p['validado'] else 'Não',
-            'Validador': p['nome_validador'] if p['validado'] else '',
-            'Data Validação': data_brasileira_filter(p['data_validacao']) if p['validado'] else ''
-        })
-        
-    df = pd.DataFrame(dados_export)
-    
-    # Criar arquivo Excel na memória
-    output = io.BytesIO()
-    with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
-        df.to_excel(writer, index=False, sheet_name='Produtos')
-        # Auto-ajustar largura das colunas (opcional)
-        # worksheet = writer.sheets['Produtos']
-        # for i, col in enumerate(df.columns):
-        #     column_len = max(df[col].astype(str).map(len).max(), len(col))
-        #     worksheet.set_column(i, i, column_len)
-            
-    output.seek(0)
-    
-    # Limpar nome do arquivo
-    nome_usuario = produtos[0]['nome_usuario']
-    data_envio_safe = re.sub(r'[^0-9a-zA-Z-]', '_', data_envio)
-    filename = f"lista_{nome_usuario}_{data_envio_safe}.xlsx"
-    
-    logger.info(f"Admin {session['user_name']} exportou a lista enviada em {data_envio} para o arquivo {filename}.")
-    
-    return send_file(output, download_name=filename, as_attachment=True, mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
-
-@app.route('/admin/pesquisar', methods=['GET'])
-def pesquisar_admin():
-    if 'user_id' not in session or not session.get('is_admin'):
-        flash('Acesso não autorizado.', 'danger')
-        return redirect(url_for('login'))
-        
-    query = request.args.get('q', '').strip()
-    resultados = []
-    if query:
-        resultados = pesquisar_produtos(query)
-        logger.info(f"Admin {session['user_name']} pesquisou por '{query}'. {len(resultados)} resultados encontrados.")
-    else:
-         # Se a query for vazia, talvez redirecionar para /admin ou mostrar mensagem?
-         pass 
-         
-    return render_template('admin_pesquisa.html', query=query, resultados=resultados)
-
-# --- Ponto de Entrada --- 
-if __name__ == '__main__':
-    # Obtém a porta da variável de ambiente PORT, padrão 5000 se não definida
-    port = int(os.environ.get('PORT', 5000))
-    # Executa o app Flask escutando em todas as interfaces (0.0.0.0)
-    # O modo debug deve ser desativado em produção!
-    app.run(host='0.0.0.0', port=port, debug=False)
+            session["user_id"] = usuario["id"]
+            session["user_name"] = usuario["nome"]
+            session["is_admin"] = bool(usuario["admin"])
+            logger.info(f"Usuário 
+(Content truncated due to size limit. Use line ranges to read in chunks)
