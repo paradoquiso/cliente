@@ -600,5 +600,5 @@ def login():
             session["user_id"] = usuario["id"]
             session["user_name"] = usuario["nome"]
             session["is_admin"] = bool(usuario["admin"])
-            logger.info(f"Usuário 
+            logger.info(f"Usuário '{nome}' (ID: {usuario['id']}, Admin: {session['is_admin']}) logado com sucesso.")
 (Content truncated due to size limit. Use line ranges to read in chunks)
