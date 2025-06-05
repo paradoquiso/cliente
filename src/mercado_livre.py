@@ -17,23 +17,35 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 logger = logging.getLogger(__name__)
 
 # --- Credenciais e Configurações --- 
-# TODO: É altamente recomendável mover estas credenciais para variáveis de ambiente
-# em um ambiente de produção para maior segurança.
-CLIENT_ID = "4200119519362485"
-CLIENT_SECRET = "m72E2336fMKGDFp7xTq2pmyt02XX1C4R"
-REDIRECT_URI = "https://cliente-v9ae.onrender.com/ml_callback"
+# Lendo as credenciais das variáveis de ambiente, conforme configurado no Render
+CLIENT_ID = os.environ.get("ML_CLIENT_ID")
+CLIENT_SECRET = os.environ.get("ML_CLIENT_SECRET")
+
+# A Redirect URI também pode vir do ambiente, se necessário, mas mantendo a fornecida por enquanto
+REDIRECT_URI = os.environ.get("ML_REDIRECT_URI", "https://cliente-v9ae.onrender.com/ml_callback")
 
 # Arquivo para persistir os dados do token
-TOKEN_FILE_PATH = "/home/ubuntu/ml_token.json" # Salvar na home do ubuntu para persistência simples
+# !! IMPORTANTE: Este caminho precisa ser ajustado para o Mount Path do Render Disk !!
+# Aguardando o caminho que você configurou no Render.
+TOKEN_FILE_PATH = "/tmp/ml_token.json" # <-- Temporário, perdido em reinicializações
+
+# Verifica se as credenciais essenciais foram carregadas
+if not CLIENT_ID or not CLIENT_SECRET:
+    logger.critical("### ERRO CRÍTICO: Variáveis de ambiente ML_CLIENT_ID ou ML_CLIENT_SECRET não definidas! A integração com Mercado Livre não funcionará. Verifique a configuração no Render. ###")
+    # Poderia lançar uma exceção ou definir um estado de erro global aqui
 
 # --- Funções de Gerenciamento de Token --- 
 
 def save_token_data(token_data):
     '''
     Salva os dados do token (access_token, refresh_token, expires_at) 
-    em um arquivo JSON.
+    em um arquivo JSON no caminho especificado por TOKEN_FILE_PATH.
     Calcula e armazena o timestamp de expiração.
     '''
+    if not TOKEN_FILE_PATH:
+        logger.error("TOKEN_FILE_PATH não está definido. Não é possível salvar o token.")
+        return False
+        
     try:
         expires_in = token_data.get("expires_in", 21600) # Padrão 6 horas
         expires_at = time.time() + expires_in
@@ -43,10 +55,16 @@ def save_token_data(token_data):
             "expires_at": expires_at,
             "obtained_at": time.time()
         }
-        # Garante que o diretório exista (se TOKEN_FILE_PATH incluir subdiretórios)
-        # token_dir = os.path.dirname(TOKEN_FILE_PATH)
-        # if token_dir and not os.path.exists(token_dir):
-        #     os.makedirs(token_dir)
+        
+        # Garante que o diretório de destino exista (necessário para Render Disks)
+        token_dir = os.path.dirname(TOKEN_FILE_PATH)
+        if token_dir and not os.path.exists(token_dir):
+            try:
+                os.makedirs(token_dir)
+                logger.info(f"Diretório para token criado: {token_dir}")
+            except OSError as e:
+                logger.error(f"Erro ao criar diretório {token_dir} para salvar token: {e}")
+                return False
             
         with open(TOKEN_FILE_PATH, "w") as f:
             json.dump(data_to_save, f, indent=2)
@@ -58,15 +76,24 @@ def save_token_data(token_data):
 
 def load_token_data():
     '''
-    Carrega os dados do token do arquivo JSON.
+    Carrega os dados do token do arquivo JSON especificado por TOKEN_FILE_PATH.
     Retorna um dicionário com os dados ou None se o arquivo não existir ou houver erro.
     '''
+    if not TOKEN_FILE_PATH:
+        logger.error("TOKEN_FILE_PATH não está definido. Não é possível carregar o token.")
+        return None
+        
     if not os.path.exists(TOKEN_FILE_PATH):
         logger.warning(f"Arquivo de token {TOKEN_FILE_PATH} não encontrado.")
         return None
     try:
         with open(TOKEN_FILE_PATH, "r") as f:
             token_data = json.load(f)
+        # Validação básica dos dados carregados
+        if not token_data.get("access_token") or not token_data.get("expires_at"):
+             logger.warning(f"Arquivo de token {TOKEN_FILE_PATH} parece inválido (faltando access_token ou expires_at).")
+             # Considerar remover/renomear o arquivo inválido
+             return None
         logger.info(f"Dados do token carregados de {TOKEN_FILE_PATH}.")
         return token_data
     except (json.JSONDecodeError, OSError) as e:
@@ -85,27 +112,33 @@ def load_token_data():
 def get_valid_access_token():
     '''
     Obtém um access token válido, atualizando-o se necessário usando o refresh token.
+    Lê as credenciais das variáveis de ambiente.
     Retorna o access_token ou None se não for possível obter um token válido.
     '''
+    # Garante que as credenciais foram carregadas
+    if not CLIENT_ID or not CLIENT_SECRET:
+        logger.error("Client ID ou Client Secret não configurados nas variáveis de ambiente.")
+        return None
+        
     token_data = load_token_data()
     if not token_data:
-        logger.error("Nenhum dado de token encontrado. É necessário autorizar a aplicação primeiro.")
-        return None
+        logger.info("Nenhum dado de token encontrado ou carregado. Autorização inicial necessária.")
+        return None # Indica que precisa autorizar
 
     current_time = time.time()
     expires_at = token_data.get("expires_at", 0)
 
     # Verifica se o token atual ainda é válido (com margem de 5 minutos)
     if current_time < expires_at - 300:
-        logger.info("Usando token de acesso existente.")
+        logger.info("Usando token de acesso existente do arquivo.")
         return token_data.get("access_token")
 
     # Se expirado, tenta usar o refresh token
     logger.info("Token de acesso expirado. Tentando atualizar usando refresh token.")
     refresh_token = token_data.get("refresh_token")
     if not refresh_token:
-        logger.error("Refresh token não encontrado. É necessário reautorizar a aplicação.")
-        # Opcional: remover o arquivo de token inválido
+        logger.error("Refresh token não encontrado no arquivo. É necessário reautorizar a aplicação.")
+        # Remove o arquivo de token inválido para forçar reautorização
         if os.path.exists(TOKEN_FILE_PATH):
              try:
                  os.remove(TOKEN_FILE_PATH)
@@ -121,8 +154,7 @@ def get_valid_access_token():
             return new_token_data.get("access_token")
         else:
             logger.error("Falha ao salvar o token atualizado.")
-            # Política de fallback: retornar o token antigo expirado? Ou None?
-            # Retornar None é mais seguro para evitar usar token potencialmente inválido.
+            # Retorna None para indicar falha, forçando reautorização ou tratamento de erro
             return None 
     else:
         logger.error("Falha ao atualizar o token de acesso usando refresh token. É necessário reautorizar.")
@@ -140,12 +172,15 @@ def get_valid_access_token():
 def get_authorization_url():
     '''
     Gera a URL de autorização para o fluxo OAuth do Mercado Livre.
-    Redireciona o usuário para esta URL para iniciar o processo.
+    Lê CLIENT_ID e REDIRECT_URI das variáveis globais (que vêm do ambiente).
     Retorna a URL ou None se o CLIENT_ID não estiver configurado.
     '''
     if not CLIENT_ID:
-        logger.error("Client ID do Mercado Livre não configurado.")
+        logger.error("Client ID do Mercado Livre (ML_CLIENT_ID) não configurado nas variáveis de ambiente.")
         return None
+    if not REDIRECT_URI:
+         logger.error("Redirect URI (ML_REDIRECT_URI) não configurada.")
+         return None # Ou usar um default?
     
     params = {
         "response_type": "code",
@@ -163,11 +198,15 @@ def exchange_code_for_token(authorization_code):
     '''
     Troca o código de autorização (obtido após o redirect do usuário)
     por um conjunto de tokens (access_token, refresh_token).
+    Lê CLIENT_ID, CLIENT_SECRET e REDIRECT_URI das variáveis globais.
     Retorna um dicionário com os dados do token ou None em caso de erro.
     '''
     if not CLIENT_ID or not CLIENT_SECRET:
-        logger.error("Client ID ou Client Secret do Mercado Livre não configurados.")
+        logger.error("Client ID ou Client Secret do Mercado Livre não configurados nas variáveis de ambiente.")
         return None
+    if not REDIRECT_URI:
+         logger.error("Redirect URI (ML_REDIRECT_URI) não configurada.")
+         return None
     
     url = "https://api.mercadolibre.com/oauth/token"
     payload = {
@@ -197,7 +236,9 @@ def exchange_code_for_token(authorization_code):
                 logger.error("Falha ao salvar o token inicial após a troca do código.")
             return token_data
         else:
-            logger.error(f"Erro ao trocar código por token: {response.status_code} - {response.text}")
+            # Log detalhado do erro da API do ML
+            error_details = response.text # Ou response.json() se o erro for JSON
+            logger.error(f"Erro ao trocar código por token: {response.status_code} - {error_details}")
             return None
             
     except requests.exceptions.RequestException as e:
@@ -210,10 +251,11 @@ def exchange_code_for_token(authorization_code):
 def refresh_access_token(refresh_token):
     '''
     Atualiza o token de acesso usando o refresh token.
+    Lê CLIENT_ID e CLIENT_SECRET das variáveis globais.
     Retorna um dicionário com os novos dados do token ou None em caso de erro.
     '''
     if not CLIENT_ID or not CLIENT_SECRET:
-        logger.error("Client ID ou Client Secret do Mercado Livre não configurados.")
+        logger.error("Client ID ou Client Secret do Mercado Livre não configurados nas variáveis de ambiente.")
         return None
     
     url = "https://api.mercadolibre.com/oauth/token"
@@ -243,7 +285,8 @@ def refresh_access_token(refresh_token):
             logger.info("Token de acesso atualizado com sucesso via refresh_token.")
             return token_data
         else:
-            logger.error(f"Erro ao atualizar token: {response.status_code} - {response.text}")
+            error_details = response.text
+            logger.error(f"Erro ao atualizar token: {response.status_code} - {error_details}")
             # Se o refresh token for inválido (ex: revogado), pode ser necessário reautenticar.
             if response.status_code in [400, 401]: 
                  logger.error("Refresh token inválido ou expirado. Reautorização necessária.")
@@ -283,6 +326,11 @@ def buscar_produto_por_ean(ean):
     com autenticação OAuth (Authorization Code Grant com Refresh Token).
     Calcula o preço médio dos anúncios encontrados.
     '''
+    # Verifica se as credenciais estão carregadas antes de prosseguir
+    if not CLIENT_ID or not CLIENT_SECRET:
+        logger.error("Busca cancelada: Client ID ou Client Secret não configurados.")
+        return fallback_busca_produto(ean, "Credenciais do Mercado Livre não configuradas no servidor.")
+        
     try:
         logger.info(f"Iniciando busca para o EAN: {ean}")
         
@@ -293,6 +341,9 @@ def buscar_produto_por_ean(ean):
             # Tenta gerar a URL de autorização para a mensagem de erro
             auth_url = get_authorization_url()
             auth_msg = " Autorize a aplicação acessando a URL de autorização." if auth_url else " Verifique as credenciais e a configuração do servidor."
+            # Se auth_url for None, o problema provavelmente são as credenciais
+            if not auth_url:
+                 auth_msg = " Verifique as credenciais ML_CLIENT_ID e ML_CLIENT_SECRET nas variáveis de ambiente."
             return fallback_busca_produto(ean, f"Falha na autenticação com o Mercado Livre.{auth_msg}")
         
         # 2. Montar Headers da Requisição
@@ -426,13 +477,15 @@ def buscar_produto_por_ean(ean):
             
             # Trata erro de autenticação (token inválido/expirado que não pôde ser atualizado)
             elif response_search.status_code == 401:
-                logger.error(f"Erro de autenticação (401) na API sites/search para EAN {ean}. Token inválido ou expirado. Resposta: {response_search.text}")
+                error_details = response.text
+                logger.error(f"Erro de autenticação (401) na API sites/search para EAN {ean}. Token inválido ou expirado. Resposta: {error_details}")
                 # O token já foi tratado por get_valid_access_token, então o problema pode ser outro (permissões?)
                 # Ou o refresh token também expirou/foi revogado.
                 return fallback_busca_produto(ean, "Erro de autenticação com o Mercado Livre. Pode ser necessário reautorizar.")
             # Trata outros erros da API
             else:
-                 logger.warning(f"API sites/search respondeu com status {response_search.status_code} para EAN {ean}: {response_search.text}")
+                 error_details = response.text
+                 logger.warning(f"API sites/search respondeu com status {response_search.status_code} para EAN {ean}: {error_details}")
                  return fallback_busca_produto(ean, f"Erro {response_search.status_code} ao consultar a API do Mercado Livre.")
         
         # Trata erros de conexão/timeout
@@ -451,46 +504,49 @@ def buscar_produto_por_ean(ean):
         logger.exception(f"Erro inesperado e fatal ao buscar produto por EAN {ean}: {str(e)}")
         return fallback_busca_produto(ean, f"Erro inesperado no sistema: {str(e)}")
 
-# Exemplo de uso (para teste direto do script, requer autorização prévia)
+# Exemplo de uso (para teste direto do script, requer autorização prévia e vars de ambiente)
 if __name__ == '__main__':
-    # 1. Verificar se existe token, senão, instruir sobre autorização
-    if not os.path.exists(TOKEN_FILE_PATH):
-        print(f"Arquivo de token não encontrado em: {TOKEN_FILE_PATH}")
-        auth_url = get_authorization_url()
-        if auth_url:
-            print("\nExecute a autorização acessando a seguinte URL no seu navegador:")
-            print(auth_url)
-            print(f"\nApós autorizar, o Mercado Livre redirecionará para {REDIRECT_URI} com um parâmetro 'code'.")
-            print("Configure a aplicação web (main.py) para estar rodando e capturar esse código na rota /ml_callback.")
-            print("A rota /ml_callback chamará exchange_code_for_token, que salvará o token.")
-        else:
-            print("\nNão foi possível gerar a URL de autorização. Verifique as credenciais (CLIENT_ID) neste script.")
+    print("--- Teste do Módulo Mercado Livre (lendo do ambiente) ---")
+    # Verifica se as credenciais foram carregadas
+    if not CLIENT_ID or not CLIENT_SECRET:
+        print("\nERRO: ML_CLIENT_ID ou ML_CLIENT_SECRET não encontrados nas variáveis de ambiente.")
+        print("Defina essas variáveis antes de executar o teste.")
     else:
-        # 2. Se o token existe, tentar buscar um EAN
-        test_ean = "7891008121025" # Exemplo EAN Coca-Cola
-        # test_ean = "7896094916688" # Exemplo EAN Fralda Pampers
-        # test_ean = "7891150033019" # Exemplo EAN Cerveja Skol
-        
-        print(f"\nTestando busca para EAN: {test_ean}")
-        resultado = buscar_produto_por_ean(test_ean)
-        print("\nResultado da Busca:")
-        print(json.dumps(resultado, indent=2, ensure_ascii=False))
+        print(f"CLIENT_ID carregado: {CLIENT_ID[:4]}...{CLIENT_ID[-4:]}") # Mostra partes do ID
+        # 1. Verificar se existe token, senão, instruir sobre autorização
+        if not os.path.exists(TOKEN_FILE_PATH):
+            print(f"\nArquivo de token não encontrado em: {TOKEN_FILE_PATH}")
+            auth_url = get_authorization_url()
+            if auth_url:
+                print("\nExecute a autorização acessando a seguinte URL no seu navegador:")
+                print(auth_url)
+                print(f"\nApós autorizar, o Mercado Livre redirecionará para {REDIRECT_URI} com um parâmetro 'code'.")
+                print("A aplicação web (main.py) deve estar rodando para capturar esse código na rota /ml_callback.")
+            else:
+                print("\nNão foi possível gerar a URL de autorização. Verifique as credenciais e a REDIRECT_URI.")
+        else:
+            # 2. Se o token existe, tentar buscar um EAN
+            test_ean = "7891008121025" # Exemplo EAN Coca-Cola
+            print(f"\nArquivo de token encontrado. Testando busca para EAN: {test_ean}")
+            resultado = buscar_produto_por_ean(test_ean)
+            print("\nResultado da Busca:")
+            print(json.dumps(resultado, indent=2, ensure_ascii=False))
 
-        # Teste de refresh (simulado - descomente para testar se houver refresh token)
-        # print("\n--- Teste de Refresh Token ---")
-        # token_data = load_token_data()
-        # if token_data and token_data.get('refresh_token'):
-        #     print(f"Usando refresh token: {token_data['refresh_token'][:10]}...")
-        #     new_token_info = refresh_access_token(token_data['refresh_token'])
-        #     if new_token_info:
-        #         print("Refresh bem-sucedido. Novos dados do token:")
-        #         print(json.dumps(new_token_info, indent=2))
-        #         # Salva o novo token (importante!)
-        #         if save_token_data(new_token_info):
-        #              print("Novos dados do token salvos com sucesso.")
-        #         else:
-        #              print("ERRO ao salvar novos dados do token.")
-        #     else:
-        #         print("Falha no refresh token. Pode ser necessário reautorizar.")
-        # else:
-        #      print("Não foi possível testar o refresh: refresh_token não encontrado no arquivo.")
+            # Teste de refresh (simulado - descomente para testar se houver refresh token)
+            # print("\n--- Teste de Refresh Token ---")
+            # token_data = load_token_data()
+            # if token_data and token_data.get('refresh_token'):
+            #     print(f"Usando refresh token: {token_data['refresh_token'][:10]}...")
+            #     new_token_info = refresh_access_token(token_data['refresh_token'])
+            #     if new_token_info:
+            #         print("Refresh bem-sucedido. Novos dados do token:")
+            #         print(json.dumps(new_token_info, indent=2))
+            #         # Salva o novo token (importante!)
+            #         if save_token_data(new_token_info):
+            #              print("Novos dados do token salvos com sucesso.")
+            #         else:
+            #              print("ERRO ao salvar novos dados do token.")
+            #     else:
+            #         print("Falha no refresh token. Pode ser necessário reautorizar.")
+            # else:
+            #      print("Não foi possível testar o refresh: refresh_token não encontrado no arquivo.")
