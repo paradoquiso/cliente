@@ -481,7 +481,7 @@ def salvar_produto(produto_data, usuario_id):
         return True
     except Exception as e:
         db.session.rollback()
-        logger.error(f"Erro ao salvar produto EAN {produto_data.get("ean")} (SQLAlchemy): {e}", exc_info=True)
+        logger.error(f"Erro ao salvar produto EAN {produto_data.get('ean')} (SQLAlchemy): {e}", exc_info=True)
         return False
 
 def enviar_lista_produtos(usuario_id, responsavel_id, pin):
