@@ -7,5 +7,4 @@ pandas==2.1.4
 openpyxl==3.1.2
 requests==2.31.0
 Werkzeug>=3.1
-# psycopg2-binary # Removido para usar SQLite
-
+psycopg2-binary # Adicionado para suporte a PostgreSQL
