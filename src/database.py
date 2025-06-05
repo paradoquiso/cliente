@@ -84,4 +84,3 @@ def create_tables(app):
         logger.error(f"Erro CRÍTICO ao criar tabelas do banco de dados: {e}", exc_info=True)
         # Considerar parar a aplicação ou lançar a exceção
         raise
-
