@@ -1,0 +1,357 @@
+<!DOCTYPE html>
+<html lang="pt-br">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Painel Administrativo - Sistema de Cadastro de Produtos</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0-alpha1/dist/css/bootstrap.min.css" rel="stylesheet">
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.10.3/font/bootstrap-icons.css">
+    <style>
+        body {
+            background-color: #f8f9fa;
+            padding-top: 20px;
+            padding-bottom: 20px;
+        }
+        .navbar {
+            margin-bottom: 20px;
+        }
+        .card {
+            margin-bottom: 20px;
+        }
+        .lista-header {
+            background-color: #f0f0f0;
+            padding: 10px;
+            margin-bottom: 15px;
+            border-radius: 5px;
+            border-left: 5px solid #007bff;
+        }
+        .lista-info {
+            font-size: 0.9rem;
+            color: #666;
+        }
+        .lista-usuario {
+            font-weight: bold;
+            color: #007bff;
+        }
+        .lista-data {
+            font-style: italic;
+        }
+        .accordion-button:not(.collapsed) {
+            background-color: #e7f1ff;
+            color: #0c63e4;
+        }
+        .validado {
+            background-color: #d4edda;
+            border-left: 5px solid #28a745;
+        }
+        .nao-validado {
+            background-color: #fff3cd;
+            border-left: 5px solid #ffc107;
+        }
+        .validacao-info {
+            font-size: 0.85rem;
+            margin-top: 5px;
+            padding: 5px 10px;
+            border-radius: 3px;
+        }
+        .validacao-badge {
+            font-weight: bold;
+            color: #28a745;
+        }
+        #notification {
+            position: fixed;
+            top: 20px;
+            right: 20px;
+            z-index: 9999;
+            display: none;
+        }
+        .search-highlight {
+            background-color: #ffff00;
+            font-weight: bold;
+        }
+        .search-container {
+            margin-bottom: 20px;
+        }
+        .search-results-info {
+            margin-top: 10px;
+            margin-bottom: 20px;
+            padding: 10px;
+            background-color: #e9ecef;
+            border-radius: 5px;
+            font-size: 0.9rem;
+        }
+        .responsavel-info {
+            font-size: 0.85rem;
+            color: #6c757d;
+            margin-left: 10px;
+        }
+        .responsavel-badge {
+            background-color: #e2f3ff;
+            color: #0d6efd;
+            padding: 2px 8px;
+            border-radius: 12px;
+            font-size: 0.8rem;
+            margin-left: 5px;
+        }
+    </style>
+</head>
+<body>
+    <nav class="navbar navbar-expand-lg navbar-dark bg-dark">
+        <div class="container">
+            <a class="navbar-brand" href="#">Painel Administrativo</a>
+            <button class="navbar-toggler" type="button" data-bs-toggle="collapse" data-bs-target="#navbarNav">
+                <span class="navbar-toggler-icon"></span>
+            </button>
+            <div class="collapse navbar-collapse" id="navbarNav">
+                <ul class="navbar-nav ms-auto">
+                    <li class="nav-item">
+                        <span class="nav-link">Olá, {{ session.usuario_nome }}</span>
+                    </li>
+                    <li class="nav-item">
+                        <a class="nav-link" href="{{ url_for('logout') }}">Sair</a>
+                    </li>
+                </ul>
+            </div>
+        </div>
+    </nav>
+
+    <div class="container">
+        <div id="notification" class="alert alert-dismissible fade show">
+            <span id="notification-message"></span>
+            <button type="button" class="btn-close" onclick="hideNotification()"></button>
+        </div>
+
+        <div class="row">
+            <div class="col-md-12">
+                <div class="card">
+                    <div class="card-header bg-primary text-white">
+                        <h5 class="card-title mb-0">Listas de Produtos Enviadas</h5>
+                    </div>
+                    <div class="card-body">
+                        <!-- Campo de pesquisa -->
+                        <div class="search-container">
+                            <form action="{{ url_for('admin_dashboard') }}" method="GET" class="row g-3">
+                                <div class="col-md-10">
+                                    <div class="input-group">
+                                        <input type="text" class="form-control" name="pesquisa" id="pesquisa" 
+                                               placeholder="Pesquisar por EAN ou palavra-chave na descrição" 
+                                               value="{{ termo_pesquisa }}">
+                                        <button class="btn btn-primary" type="submit">
+                                            <i class="bi bi-search"></i> Pesquisar
+                                        </button>
+                                    </div>
+                                </div>
+                                <div class="col-md-2">
+                                    {% if termo_pesquisa %}
+                                    <a href="{{ url_for('admin') }}" class="btn btn-outline-secondary w-100">
+                                        <i class="bi bi-x-circle"></i> Limpar
+                                    </a>
+                                    {% endif %}
+                                </div>
+                            </form>
+                        </div>
+
+                        <!-- Informações de resultados da pesquisa -->
+                        {% if termo_pesquisa %}
+                        <div class="search-results-info">
+                            {% if listas_agrupadas %}
+                                <i class="bi bi-info-circle"></i> 
+                                Resultados da pesquisa por "<strong>{{ termo_pesquisa }}</strong>" - 
+                                Encontrados produtos em {{ listas_agrupadas|length }} lista(s)
+                            {% else %}
+                                <i class="bi bi-exclamation-triangle"></i> 
+                                Nenhum resultado encontrado para "<strong>{{ termo_pesquisa }}</strong>"
+                            {% endif %}
+                        </div>
+                        {% endif %}
+
+                        {% if listas_agrupadas %}
+                            <div class="accordion" id="listasAccordion">
+                                {% for (data_envio, nome_usuario), lista in listas_agrupadas.items() %}
+                                    <div class="accordion-item">
+                                        <h2 class="accordion-header" id="heading{{ loop.index }}">
+                                            <button class="accordion-button {% if not loop.first and not termo_pesquisa %}collapsed{% endif %} {% if lista.validado %}validado{% else %}nao-validado{% endif %}" type="button" data-bs-toggle="collapse" data-bs-target="#collapse{{ loop.index }}" aria-expanded="{{ 'true' if loop.first or termo_pesquisa else 'false' }}" aria-controls="collapse{{ loop.index }}">
+                                                <div class="d-flex justify-content-between w-100">
+                                                    <span>
+                                                        Lista de <span class="lista-usuario">{{ nome_usuario }}</span>
+                                                        {% if lista.nome_responsavel %}
+                                                        <span class="responsavel-badge">
+                                                            <i class="bi bi-person-check"></i> Resp: {{ lista.nome_responsavel }}
+                                                        </span>
+                                                        {% endif %}
+                                                    </span>
+                                                    <div class="d-flex align-items-center">
+                                                        {% if lista.validado %}
+                                                            <span class="badge bg-success me-2">Validada</span>
+                                                        {% else %}
+                                                            <span class="badge bg-warning me-2">Pendente</span>
+                                                        {% endif %}
+                                                        <span class="lista-data">{{ data_envio|data_brasileira }}</span>
+                                                    </div>
+                                                </div>
+                                            </button>
+                                        </h2>
+                                        <div id="collapse{{ loop.index }}" class="accordion-collapse collapse {% if loop.first or termo_pesquisa %}show{% endif %}" aria-labelledby="heading{{ loop.index }}" data-bs-parent="#listasAccordion">
+                                            <div class="accordion-body">
+                                                {% if lista.validado %}
+                                                    <div class="validacao-info bg-light">
+                                                        <i class="bi bi-check-circle-fill text-success"></i> 
+                                                        Validada por <span class="validacao-badge">{{ lista.nome_validador }}</span> em {{ lista.data_validacao|data_brasileira }}
+                                                    </div>
+                                                {% else %}
+                                                    <div class="d-flex justify-content-end mb-3">
+                                                        <button class="btn btn-success btn-sm validar-btn" 
+                                                                data-data-envio="{{ data_envio }}" 
+                                                                data-nome-usuario="{{ nome_usuario }}">
+                                                            <i class="bi bi-check-lg"></i> Validar Lista
+                                                        </button>
+                                                    </div>
+                                                {% endif %}
+                                                
+                                                <div class="table-responsive">
+                                                    <table class="table table-striped table-hover">
+                                                        <thead>
+                                                            <tr>
+                                                                <th>EAN</th>
+                                                                <th>Nome</th>
+                                                                <th>Cor</th>
+                                                                <th>Voltagem</th>
+                                                                <th>Modelo</th>
+                                                                <th>Quantidade</th>
+                                                            </tr>
+                                                        </thead>
+                                                        <tbody>
+                                                            {% for produto in lista.produtos %}
+                                                                <tr class="{% if termo_pesquisa and (termo_pesquisa in produto.ean or termo_pesquisa.lower() in produto.nome.lower() or termo_pesquisa.lower() in produto.cor.lower() or termo_pesquisa.lower() in produto.modelo.lower()) %}search-highlight{% endif %}">
+                                                                    <td>{{ produto.ean }}</td>
+                                                                    <td>{{ produto.nome }}</td>
+                                                                    <td>{{ produto.cor }}</td>
+                                                                    <td>{{ produto.voltagem }}</td>
+                                                                    <td>{{ produto.modelo }}</td>
+                                                                    <td>{{ produto.quantidade }}</td>
+                                                                </tr>
+                                                            {% endfor %}
+                                                        </tbody>
+                                                    </table>
+                                                </div>
+                                            </div>
+                                        </div>
+                                    </div>
+                                {% endfor %}
+                            </div>
+                        {% else %}
+                            <div class="alert alert-info">
+                                {% if termo_pesquisa %}
+                                    Nenhum produto encontrado para "{{ termo_pesquisa }}".
+                                {% else %}
+                                    Nenhuma lista de produtos foi enviada ainda.
+                                {% endif %}
+                            </div>
+                        {% endif %}
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Modal de Confirmação de Validação -->
+    <div class="modal fade" id="validarModal" tabindex="-1" aria-labelledby="validarModalLabel" aria-hidden="true">
+        <div class="modal-dialog">
+            <div class="modal-content">
+                <div class="modal-header">
+                    <h5 class="modal-title" id="validarModalLabel">Confirmar Validação</h5>
+                    <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Fechar"></button>
+                </div>
+                <div class="modal-body">
+                    <p>Você está prestes a validar a lista de <span id="modal-usuario" class="fw-bold"></span>.</p>
+                    <p>Esta ação registrará seu nome como validador e não poderá ser desfeita.</p>
+                    <p>Deseja continuar?</p>
+                </div>
+                <div class="modal-footer">
+                    <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Cancelar</button>
+                    <button type="button" class="btn btn-success" id="confirmarValidacao">Confirmar Validação</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0-alpha1/dist/js/bootstrap.bundle.min.js"></script>
+    <script>
+        document.addEventListener('DOMContentLoaded', function() {
+            // Elementos do DOM
+            const validarBtns = document.querySelectorAll('.validar-btn');
+            const validarModal = new bootstrap.Modal(document.getElementById('validarModal'));
+            const modalUsuario = document.getElementById('modal-usuario');
+            const confirmarValidacaoBtn = document.getElementById('confirmarValidacao');
+            
+            let dataEnvioAtual = '';
+            let nomeUsuarioAtual = '';
+            
+            // Configurar botões de validação
+            validarBtns.forEach(btn => {
+                btn.addEventListener('click', function() {
+                    dataEnvioAtual = this.getAttribute('data-data-envio');
+                    nomeUsuarioAtual = this.getAttribute('data-nome-usuario');
+                    
+                    modalUsuario.textContent = nomeUsuarioAtual;
+                    validarModal.show();
+                });
+            });
+            
+            // Confirmar validação
+            confirmarValidacaoBtn.addEventListener('click', function() {
+                // Enviar requisição para validar a lista
+                fetch('/api/validar-lista', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                    },
+                    body: JSON.stringify({
+                        data_envio: dataEnvioAtual,
+                        nome_usuario: nomeUsuarioAtual
+                    })
+                })
+                .then(response => response.json())
+                .then(data => {
+                    validarModal.hide();
+                    
+                    if (data.success) {
+                        showNotification('Lista validada com sucesso!', 'success');
+                        // Recarregar a página após 1 segundo
+                        setTimeout(() => {
+                            window.location.reload();
+                        }, 1000);
+                    } else {
+                        showNotification('Erro ao validar lista: ' + data.error, 'danger');
+                    }
+                })
+                .catch(error => {
+                    validarModal.hide();
+                    showNotification('Erro ao processar requisição: ' + error, 'danger');
+                });
+            });
+            
+            // Função para exibir notificações
+            window.showNotification = function(message, type) {
+                const notification = document.getElementById('notification');
+                const notificationMessage = document.getElementById('notification-message');
+                
+                notification.className = 'alert alert-' + type + ' alert-dismissible fade show';
+                notificationMessage.textContent = message;
+                notification.style.display = 'block';
+                
+                // Esconder automaticamente após 5 segundos
+                setTimeout(() => {
+                    hideNotification();
+                }, 5000);
+            };
+            
+            // Função para esconder notificações
+            window.hideNotification = function() {
+                const notification = document.getElementById('notification');
+                notification.style.display = 'none';
+            };
+        });
+    </script>
+</body>
+</html>

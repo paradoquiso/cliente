@@ -1,0 +1,562 @@
+<!DOCTYPE html>
+<html lang="pt-br">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Cadastro de Produtos por EAN</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0-alpha1/dist/css/bootstrap.min.css" rel="stylesheet">
+    <style>
+        body {
+            background-color: #f8f9fa;
+            padding-top: 20px;
+            padding-bottom: 20px;
+        }
+        .navbar {
+            margin-bottom: 20px;
+        }
+        .card {
+            margin-bottom: 20px;
+        }
+        .alert {
+            margin-bottom: 20px;
+        }
+        .table th, .table td {
+            vertical-align: middle;
+        }
+        .btn-action {
+            margin-right: 5px;
+        }
+        #notification {
+            position: fixed;
+            top: 20px;
+            right: 20px;
+            z-index: 9999;
+            display: none;
+        }
+        #preco_medio_display {
+            font-weight: bold;
+            color: #0d6efd; /* Azul Bootstrap */
+        }
+    </style>
+</head>
+<body>
+    <nav class="navbar navbar-expand-lg navbar-dark bg-dark">
+        <div class="container">
+            <a class="navbar-brand" href="#">Sistema de Cadastro de Produtos</a>
+            <button class="navbar-toggler" type="button" data-bs-toggle="collapse" data-bs-target="#navbarNav">
+                <span class="navbar-toggler-icon"></span>
+            </button>
+            <div class="collapse navbar-collapse" id="navbarNav">
+                <ul class="navbar-nav ms-auto">
+                    <li class="nav-item">
+                        <span class="nav-link">Olá, {{ session.usuario_nome }}</span>
+                    </li>
+                    <!-- Removido status e botão de autorização ML -->
+                    <li class="nav-item">
+                        <a class="nav-link" href="{{ url_for('logout') }}">Sair</a>
+                    </li>
+                </ul>
+            </div>
+        </div>
+    </nav>
+
+    <div class="container">
+        <!-- Mensagens Flash -->
+        {% with messages = get_flashed_messages(with_categories=true) %}
+            {% if messages %}
+                {% for category, message in messages %}
+                    <div class="alert alert-{{ category or 'info' }} alert-dismissible fade show" role="alert">
+                        {{ message }}
+                        <button type="button" class="btn-close" data-bs-dismiss="alert" aria-label="Close"></button>
+                    </div>
+                {% endfor %}
+            {% endif %}
+        {% endwith %}
+
+        <div id="notification" class="alert alert-success alert-dismissible fade show">
+            <span id="notification-message"></span>
+            <button type="button" class="btn-close" onclick="hideNotification()"></button>
+        </div>
+
+        <div class="row">
+            <div class="col-md-12">
+                <div class="card">
+                    <div class="card-header bg-primary text-white">
+                        <h5 class="card-title mb-0">Adicionar Novo Produto</h5>
+                    </div>
+                    <div class="card-body">
+                        <form id="productForm">
+                            <input type="hidden" id="preco_medio_hidden">
+                            <div class="row">
+                                <div class="col-md-4 mb-3">
+                                    <label for="ean" class="form-label">EAN (Código de Barras)*</label>
+                                    <div class="input-group">
+                                        <input type="text" class="form-control" id="ean" required>
+                                        <button class="btn btn-outline-secondary" type="button" id="searchBtn">Buscar</button>
+                                    </div>
+                                </div>
+                                <div class="col-md-8 mb-3">
+                                    <label for="nome" class="form-label">Nome do Produto*</label>
+                                    <input type="text" class="form-control" id="nome" required>
+                                </div>
+                            </div>
+                            <div class="row">
+                                <div class="col-md-3 mb-3">
+                                    <label for="cor" class="form-label">Cor</label>
+                                    <input type="text" class="form-control" id="cor">
+                                </div>
+                                <div class="col-md-3 mb-3">
+                                    <label for="voltagem" class="form-label">Voltagem</label>
+                                    <input type="text" class="form-control" id="voltagem">
+                                </div>
+                                <div class="col-md-3 mb-3">
+                                    <label for="modelo" class="form-label">Modelo</label>
+                                    <input type="text" class="form-control" id="modelo">
+                                </div>
+                                <div class="col-md-3 mb-3">
+                                    <label for="preco_medio_display" class="form-label">Preço Médio (ML)</label>
+                                    <input type="text" class="form-control" id="preco_medio_display" readonly disabled>
+                                </div>
+                            </div>
+                            <div class="row">
+                                <div class="col-md-4 mb-3">
+                                    <label for="quantidade" class="form-label">Quantidade*</label>
+                                    <input type="number" class="form-control" id="quantidade" value="1" min="1" required>
+                                </div>
+                                <div class="col-md-8 d-flex align-items-end mb-3">
+                                    <button type="submit" class="btn btn-primary">Adicionar Produto</button>
+                                </div>
+                            </div>
+                        </form>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <div class="row mt-4">
+            <div class="col-md-12">
+                <div class="card">
+                    <div class="card-header bg-success text-white d-flex justify-content-between align-items-center">
+                        <h5 class="card-title mb-0">Produtos Cadastrados (Não Enviados)</h5>
+                        <div>
+                            <button id="enviarListaBtn" class="btn btn-light btn-sm">Enviar Lista</button>
+                        </div>
+                    </div>
+                    <div class="card-body">
+                        <div class="table-responsive">
+                            <table class="table table-striped table-hover">
+                                <thead>
+                                    <tr>
+                                        <th>EAN</th>
+                                        <th>Nome</th>
+                                        <th>Cor</th>
+                                        <th>Voltagem</th>
+                                        <th>Modelo</th>
+                                        <th>Preço Médio</th>
+                                        <th>Quantidade</th>
+                                        <th>Ações</th>
+                                    </tr>
+                                </thead>
+                                <tbody id="productList">
+                                    {% for produto in produtos %}
+                                    <tr data-id="{{ produto.id }}">
+                                        <td>{{ produto.ean }}</td>
+                                        <td>{{ produto.nome }}</td>
+                                        <td>{{ produto.cor or '' }}</td>
+                                        <td>{{ produto.voltagem or '' }}</td>
+                                        <td>{{ produto.modelo or '' }}</td>
+                                        <td>{{ "R$ %.2f"|format(produto.preco_medio) if produto.preco_medio else "N/A" }}</td>
+                                        <td>{{ produto.quantidade }}</td>
+                                        <td>
+                                            <button class="btn btn-danger btn-sm delete-btn" data-id="{{ produto.id }}">Excluir</button>
+                                        </td>
+                                    </tr>
+                                    {% else %}
+                                    <tr id="empty-row">
+                                        <td colspan="8" class="text-center">Nenhum produto cadastrado</td>
+                                    </tr>
+                                    {% endfor %}
+                                </tbody>
+                            </table>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Modal de Confirmação de Envio com PIN -->
+    <div class="modal fade" id="confirmEnvioModal" tabindex="-1" aria-labelledby="confirmEnvioModalLabel" aria-hidden="true">
+        <div class="modal-dialog">
+            <div class="modal-content">
+                <div class="modal-header">
+                    <h5 class="modal-title" id="confirmEnvioModalLabel">Confirmação de Envio</h5>
+                    <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Fechar"></button>
+                </div>
+                <div class="modal-body">
+                    <p>Para confirmar o envio da lista, informe a senha PIN do responsável.</p>
+                    <form id="confirmEnvioForm">
+                        <div class="mb-3">
+                            <label for="responsavel" class="form-label">Responsável*</label>
+                            <select class="form-select" id="responsavel" required>
+                                <option value="">Selecione o responsável</option>
+                            </select>
+                        </div>
+                        <div class="mb-3">
+                            <label for="pin" class="form-label">Senha PIN (4 dígitos)*</label>
+                            <input type="password" class="form-control" id="pin" maxlength="4" pattern="[0-9]{4}" required placeholder="Digite a senha PIN de 4 dígitos do responsável selecionado">
+                            <div class="form-text">Digite a senha PIN de 4 dígitos do responsável selecionado.</div>
+                        </div>
+                    </form>
+                </div>
+                <div class="modal-footer">
+                    <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Cancelar</button>
+                    <button type="button" class="btn btn-primary" id="confirmarEnvioBtn">Confirmar Envio</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0-alpha1/dist/js/bootstrap.bundle.min.js"></script>
+    <script>
+        function formatCurrency(value) {
+            if (value === null || value === undefined || isNaN(value)) {
+                return "N/A";
+            }
+            return `R$ ${parseFloat(value).toFixed(2).replace('.', ',')}`;
+        }
+        
+        function showNotification(message, type = 'success') {
+            const notification = document.getElementById('notification');
+            const notificationMessage = document.getElementById('notification-message');
+            notification.className = `alert alert-${type} alert-dismissible fade show`;
+            notificationMessage.textContent = message;
+            notification.style.display = 'block';
+            setTimeout(hideNotification, 5000);
+        }
+
+        function hideNotification() {
+            const notification = document.getElementById('notification');
+            notification.style.display = 'none';
+        }
+        
+        function updateProductList(produtos) {
+            const productListBody = document.getElementById('productList');
+            productListBody.innerHTML = '';
+            if (produtos && produtos.length > 0) {
+                produtos.forEach(produto => {
+                    const row = document.createElement('tr');
+                    row.setAttribute('data-id', produto.id);
+                    row.innerHTML = `
+                        <td>${produto.ean}</td>
+                        <td>${produto.nome}</td>
+                        <td>${produto.cor || ''}</td>
+                        <td>${produto.voltagem || ''}</td>
+                        <td>${produto.modelo || ''}</td>
+                        <td>${formatCurrency(produto.preco_medio)}</td>
+                        <td>${produto.quantidade}</td>
+                        <td>
+                            <button class="btn btn-danger btn-sm delete-btn" data-id="${produto.id}">Excluir</button>
+                        </td>
+                    `;
+                    productListBody.appendChild(row);
+                });
+            } else {
+                productListBody.innerHTML = '<tr id="empty-row"><td colspan="8" class="text-center">Nenhum produto cadastrado</td></tr>';
+            }
+            addDeleteEventListeners();
+        }
+        
+        function addDeleteEventListeners() {
+            document.querySelectorAll('.delete-btn').forEach(button => {
+                button.removeEventListener('click', handleDeleteClick);
+                button.addEventListener('click', handleDeleteClick);
+            });
+        }
+        
+        function handleDeleteClick(event) {
+            const produtoId = event.target.getAttribute('data-id');
+            if (confirm('Tem certeza que deseja excluir este produto?')) {
+                fetch(`/api/produtos/${produtoId}`, { method: 'DELETE' })
+                .then(response => {
+                    if (!response.ok) {
+                        return response.json().then(err => { throw new Error(err.error || `Erro ${response.status}`) });
+                    }
+                    // Precisa buscar a lista atualizada após excluir
+                    return fetch('/api/produtos'); 
+                })
+                .then(response => response.json()) // Converte a resposta da busca em JSON
+                .then(updatedProdutos => {
+                    showNotification('Produto excluído com sucesso!', 'success');
+                    updateProductList(updatedProdutos); // Atualiza a lista
+                })
+                .catch(error => {
+                    console.error('Erro ao excluir produto:', error);
+                    showNotification(`Erro ao excluir produto: ${error.message}`, 'danger');
+                });
+            }
+        }
+
+        document.addEventListener('DOMContentLoaded', function() {
+            const productForm = document.getElementById('productForm');
+            const searchBtn = document.getElementById('searchBtn');
+            const eanInput = document.getElementById('ean');
+            const nomeInput = document.getElementById('nome');
+            const corInput = document.getElementById('cor');
+            const voltagemInput = document.getElementById('voltagem');
+            const modeloInput = document.getElementById('modelo');
+            const quantidadeInput = document.getElementById('quantidade');
+            const precoMedioDisplay = document.getElementById('preco_medio_display');
+            const precoMedioHidden = document.getElementById('preco_medio_hidden');
+            const enviarListaBtn = document.getElementById('enviarListaBtn');
+            const confirmEnvioModal = new bootstrap.Modal(document.getElementById('confirmEnvioModal'));
+            const confirmEnvioForm = document.getElementById('confirmEnvioForm');
+            const responsavelSelect = document.getElementById('responsavel');
+            const pinInput = document.getElementById('pin');
+            const confirmarEnvioBtn = document.getElementById('confirmarEnvioBtn');
+            
+            // Inicializar lista de responsáveis
+            fetch('/api/responsaveis')
+            .then(response => response.json())
+            .then(responsaveis => {
+                responsavelSelect.innerHTML = '<option value="">Selecione o responsável</option>';
+                responsaveis.forEach(resp => {
+                    const option = document.createElement('option');
+                    option.value = resp.id;
+                    option.textContent = resp.nome;
+                    responsavelSelect.appendChild(option);
+                });
+            })
+            .catch(error => {
+                console.error('Erro ao carregar responsáveis:', error);
+                showNotification('Erro ao carregar lista de responsáveis', 'danger');
+            });
+            
+            // Buscar produto por EAN
+            searchBtn.addEventListener('click', function() {
+                const ean = eanInput.value.trim();
+                if (!ean) {
+                    showNotification('Por favor, informe o código EAN', 'warning');
+                    return;
+                }
+
+                showNotification('Buscando produto online...', 'info'); // Updated message
+
+                // Corrected fetch call: POST to /buscar_ean with form data
+                fetch('/buscar_ean', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/x-www-form-urlencoded', // Send as form data
+                    },
+                    body: `ean=${encodeURIComponent(ean)}` // Encode EAN and send in body
+                })
+                .then(response => {
+                     // Handle potential non-JSON responses first (like 401 HTML page if token fails)
+                     if (!response.ok) {
+                         // Try to parse JSON for specific error messages from backend
+                         return response.json().then(err => {
+                             // Check for specific error flags from backend
+                             if (response.status === 401 && err.needs_ml_auth) {
+                                 // Specific handling for ML auth needed
+                                 showNotification(err.message || 'Autorização do Mercado Livre necessária ou expirada.', 'warning');
+                                 // Consider adding a button/link here to redirect to /ml_login
+                             } else {
+                                 // Throw a generic error with the message from backend if available
+                                 throw new Error(err.message || `Erro ${response.status}`);
+                             }
+                             // Return rejection to prevent falling into the next .then
+                             return Promise.reject(new Error(err.message || `Erro ${response.status}`));
+                         }).catch(jsonError => {
+                             // If response is not JSON (e.g., HTML error page), throw a generic error based on status text
+                             console.error("Response was not valid JSON:", jsonError);
+                             // Check for the original error reported by the user
+                             if (response.headers.get("content-type")?.includes("text/html")) {
+                                 // This is likely the "Unexpected token '<'" scenario
+                                 throw new Error(`Erro ${response.status}: Recebido HTML inesperado do servidor. Verifique os logs do servidor ou a autorização do Mercado Livre.`);
+                             } else {
+                                 throw new Error(`Erro ${response.status}: ${response.statusText}. A resposta do servidor não foi JSON.`);
+                             }
+                         });
+                     }
+                     // If response is OK (2xx), parse JSON
+                     return response.json();
+                 })
+                .then(data => {
+                    // Backend returns {success: bool, data: {...}, message: str, source: str}
+                    if (data.success) {
+                        const produtoData = data.data;
+                        nomeInput.value = produtoData.nome || ''; // Use fallback for safety
+                        corInput.value = produtoData.cor || '';
+                        voltagemInput.value = produtoData.voltagem || '';
+                        modeloInput.value = produtoData.modelo || '';
+
+                        if (produtoData.preco_medio !== null && produtoData.preco_medio !== undefined) {
+                            precoMedioDisplay.value = formatCurrency(produtoData.preco_medio);
+                            precoMedioHidden.value = produtoData.preco_medio;
+                        } else {
+                            precoMedioDisplay.value = "N/A";
+                            precoMedioHidden.value = "";
+                        }
+                        showNotification(data.message || 'Produto encontrado!', 'success');
+                    } else {
+                        // Handle failure case reported by backend (e.g., product not found, ML API error)
+                        showNotification(data.message || 'Produto não encontrado ou erro na busca online.', 'warning');
+                        // Clear fields except EAN
+                        nomeInput.value = '';
+                        corInput.value = '';
+                        voltagemInput.value = '';
+                        modeloInput.value = '';
+                        precoMedioDisplay.value = '';
+                        precoMedioHidden.value = '';
+                    }
+                })
+                .catch(error => {
+                    // Catch errors from fetch itself or thrown errors from .then blocks
+                    console.error('Erro na busca EAN:', error);
+                    showNotification(`Erro na busca: ${error.message || 'Ocorreu um erro inesperado.'}`, 'danger');
+                    // Clear fields on error except EAN
+                    nomeInput.value = '';
+                    corInput.value = '';
+                    voltagemInput.value = '';
+                    modeloInput.value = '';
+                    precoMedioDisplay.value = '';
+                    precoMedioHidden.value = '';
+                });
+            });
+            
+            // Adicionar produto
+            productForm.addEventListener('submit', function(e) {
+                e.preventDefault();
+                
+                const produto = {
+                    ean: eanInput.value.trim(),
+                    nome: nomeInput.value.trim(),
+                    cor: corInput.value.trim(),
+                    voltagem: voltagemInput.value.trim(),
+                    modelo: modeloInput.value.trim(),
+                    quantidade: parseInt(quantidadeInput.value, 10),
+                    preco_medio: precoMedioHidden.value ? parseFloat(precoMedioHidden.value) : null
+                };
+                
+                if (!produto.ean || !produto.nome || isNaN(produto.quantidade) || produto.quantidade < 1) {
+                    showNotification('Por favor, preencha todos os campos obrigatórios', 'warning');
+                    return;
+                }
+                
+                fetch('/api/produtos', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                    },
+                    body: JSON.stringify(produto)
+                })
+                .then(response => {
+                    if (!response.ok) {
+                        return response.json().then(err => { throw new Error(err.error || `Erro ${response.status}`) });
+                    }
+                    return response.json();
+                })
+                .then(data => {
+                    showNotification('Produto adicionado com sucesso!', 'success');
+                    
+                    // Limpar formulário
+                    productForm.reset();
+                    precoMedioDisplay.value = "";
+                    precoMedioHidden.value = "";
+                    
+                    // Atualizar lista de produtos
+                    return fetch('/api/produtos');
+                })
+                .then(response => response.json())
+                .then(produtos => {
+                    updateProductList(produtos);
+                })
+                .catch(error => {
+                    console.error('Erro ao adicionar produto:', error);
+                    showNotification(`Erro ao adicionar produto: ${error.message}`, 'danger');
+                });
+            });
+            
+            // Carregar produtos iniciais
+            fetch('/api/produtos')
+            .then(response => response.json())
+            .then(produtos => {
+                updateProductList(produtos);
+            })
+            .catch(error => {
+                console.error('Erro ao carregar produtos:', error);
+                showNotification('Erro ao carregar lista de produtos', 'danger');
+            });
+            
+            // Configurar botão de enviar lista
+            enviarListaBtn.addEventListener('click', function() {
+                fetch('/api/produtos')
+                .then(response => response.json())
+                .then(produtos => {
+                    if (!produtos || produtos.length === 0) {
+                        showNotification('Não há produtos para enviar', 'warning');
+                        return;
+                    }
+                    confirmEnvioModal.show();
+                })
+                .catch(error => {
+                    console.error('Erro ao verificar produtos:', error);
+                    showNotification('Erro ao verificar produtos para envio', 'danger');
+                });
+            });
+            
+            // Confirmar envio da lista
+            confirmarEnvioBtn.addEventListener('click', function() {
+                const responsavelId = responsavelSelect.value;
+                const pin = pinInput.value.trim();
+                
+                if (!responsavelId || !pin) {
+                    showNotification('Por favor, selecione o responsável e informe o PIN', 'warning');
+                    return;
+                }
+                
+                if (pin.length !== 4 || !/^\d+$/.test(pin)) {
+                    showNotification('O PIN deve conter 4 dígitos numéricos', 'warning');
+                    return;
+                }
+                
+                fetch('/api/enviar_lista', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                    },
+                    body: JSON.stringify({
+                        responsavel_id: parseInt(responsavelId, 10),
+                        pin: pin
+                    })
+                })
+                .then(response => {
+                    if (!response.ok) {
+                        return response.json().then(err => { throw new Error(err.error || `Erro ${response.status}`) });
+                    }
+                    return response.json();
+                })
+                .then(data => {
+                    confirmEnvioModal.hide();
+                    showNotification('Lista enviada com sucesso!', 'success');
+                    confirmEnvioForm.reset();
+                    
+                    // Atualizar lista de produtos (que agora deve estar vazia)
+                    return fetch('/api/produtos');
+                })
+                .then(response => response.json())
+                .then(produtos => {
+                    updateProductList(produtos);
+                })
+                .catch(error => {
+                    console.error('Erro ao enviar lista:', error);
+                    showNotification(`Erro ao enviar lista: ${error.message}`, 'danger');
+                });
+            });
+            
+            // Inicializar event listeners para botões de exclusão
+            addDeleteEventListeners();
+        });
+    </script>
+</body>
+</html>
